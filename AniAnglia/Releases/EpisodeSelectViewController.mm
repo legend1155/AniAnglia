@@ -252,7 +252,12 @@
     [table_view deselectRowAtIndexPath:index_path animated:YES];
     anixart::Episode::Ptr episode = _episodes[index];
     NSMutableArray<NSNumber*>* positions = [NSMutableArray new];
-    for (const auto& item : _episodes) [positions addObject:@(item->position)];
+    NSMutableDictionary<NSNumber*, NSString*>* names = [NSMutableDictionary new];
+    for (const auto& item : _episodes) {
+        [positions addObject:@(item->position)];
+        names[@(item->position)] = TO_NSSTRING(item->name) ?: @"";
+    }
+    [[PlayerController sharedInstance] setEpisodeNames:names];
     [[PlayerController sharedInstance] setEpisodePositions:positions];
     [[PlayerController sharedInstance] playWithReleaseID:_release_id sourceID:_source_id position:episode->position autoShow:YES completion:^(BOOL errored) {}];
 }

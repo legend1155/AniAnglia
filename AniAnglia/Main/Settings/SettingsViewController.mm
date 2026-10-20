@@ -93,7 +93,7 @@
 }
 -(void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self.tableView reloadData]; }
 -(NSString*)tableView:(UITableView*)tableView titleForFooterInSection:(NSInteger)section {
-    return self.cacheMode ? @"Кеш только изображений, с учётом HTTP-политики сервера. Видео для офлайн-просмотра не сохраняются." : @"Skip, прогресс и автоматические переходы работают во встроенном iOS-плеере. В веб-плеере ими управляет сайт. Опенинг пропускается только по подтверждённым границам этой серии и версии видео. Без меток ничего не вырезается. Пропуск конца серии — отдельная настройка перехода до титров.";
+    return self.cacheMode ? @"Кеш только изображений, с учётом HTTP-политики сервера. Видео для офлайн-просмотра не сохраняются." : @"Skip, прогресс и автоматические переходы работают во встроенном iOS-плеере. В веб-плеере ими управляет сайт. AniSkip автоматически ищет сезон через Jikan и применяет таймкоды подходящей серии и длительности видео. Без меток ничего не вырезается. Пропуск конца серии — отдельная настройка перехода до титров.";
 }
 -(NSInteger)tableView:(UITableView*)tableView numberOfRowsInSection:(NSInteger)section { return self.cacheMode ? 2 : 12; }
 -(UITableViewCell*)tableView:(UITableView*)tableView cellForRowAtIndexPath:(NSIndexPath*)path {
@@ -103,16 +103,16 @@
         if (!path.row) cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld МБ", (long)[self.settings getMaxCacheSizeBytes]/1024/1024];
         return cell;
     }
-    NSArray* titles = @[@"Плеер", @"Качество", @"Озвучка по умолчанию", @"Источник по умолчанию", @"Запоминать выбор", @"Следующая серия автоматически", @"Автопропуск опенинга", @"Границы опенинга", @"Безопасный автопропуск", @"Пропускать конец серии", @"Последние секунды до перехода", @"Сбросить прогресс просмотра"];
+    NSArray* titles = @[@"Плеер", @"Качество", @"Озвучка по умолчанию", @"Источник по умолчанию", @"Запоминать выбор", @"Следующая серия автоматически", @"Автопропуск опенинга", @"Границы опенинга", @"AniSkip: автопоиск таймкодов", @"Пропускать конец серии", @"Последние секунды до перехода", @"Сбросить прогресс просмотра"];
     cell.textLabel.text = titles[path.row];
-    NSArray* keys = @[@"default_player", @"preffered_quality", @"preferred_type_name", @"preferred_source_name", @"remember_source", @"auto_next_video", @"auto_skip_opening", @"", @"", @"auto_skip_ending", @"ending_skip_time"];
-    if ((path.row >= 4 && path.row <= 6) || path.row == 9) {
+    NSArray* keys = @[@"default_player", @"preffered_quality", @"preferred_type_name", @"preferred_source_name", @"remember_source", @"auto_next_video", @"auto_skip_opening", @"", @"aniskip_auto_lookup", @"auto_skip_ending", @"ending_skip_time"];
+    if ((path.row >= 4 && path.row <= 6) || path.row == 8 || path.row == 9) {
         UISwitch* toggle = [UISwitch new]; toggle.tag = path.row;
         toggle.on = [[self.settings getSettingsObjectAtKey:keys[path.row]] boolValue];
         [toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
         cell.accessoryView = toggle;
-    } else if (path.row == 7 || path.row == 8) {
-        cell.detailTextLabel.text = path.row == 7 ? @"В плеере → Опенинг" : @"По меткам серии";
+    } else if (path.row == 7) {
+        cell.detailTextLabel.text = @"В плеере → Опенинг";
     } else if (path.row < keys.count) {
         id value = [self.settings getSettingsObjectAtKey:keys[path.row]];
         cell.detailTextLabel.text = path.row == 0 ? ([value integerValue] == 2 ? @"Веб" : @"iOS") : [value description];
@@ -121,7 +121,7 @@
 }
 -(void)toggleChanged:(UISwitch*)sender {
     NSArray* keys = @[@"remember_source", @"auto_next_video", @"auto_skip_opening"];
-    NSString* key = sender.tag == 9 ? @"auto_skip_ending" : keys[sender.tag - 4];
+    NSString* key = sender.tag == 9 ? @"auto_skip_ending" : (sender.tag == 8 ? @"aniskip_auto_lookup" : keys[sender.tag - 4]);
     [self.settings setSettingsObject:@(sender.on) atKey:key];
 }
 -(void)tableView:(UITableView*)tableView didSelectRowAtIndexPath:(NSIndexPath*)path {
@@ -130,15 +130,15 @@
         [[NSURLCache sharedURLCache] removeAllCachedResponses];
         [tableView reloadData]; return;
     }
-    if (!self.cacheMode && ((path.row >= 4 && path.row <= 6) || path.row == 9)) return;
+    if (!self.cacheMode && ((path.row >= 4 && path.row <= 6) || path.row == 8 || path.row == 9)) return;
     if (!self.cacheMode && (path.row == 2 || path.row == 3)) {
         PlaybackChoiceViewController* choices = [[PlaybackChoiceViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
         choices.preferenceKey = path.row == 2 ? @"preferred_type_name" : @"preferred_source_name";
         choices.title = path.row == 2 ? @"Озвучка по умолчанию" : @"Источник по умолчанию";
         [self.navigationController pushViewController:choices animated:YES]; return;
     }
-    if (!self.cacheMode && (path.row == 7 || path.row == 8)) {
-        UIAlertController* info = [UIAlertController alertControllerWithTitle:@"Точный пропуск опенинга" message:@"Открой серию во встроенном плеере → Опенинг. Можно отметить начало/конец вручную или запросить AniSkip после привязки MAL ID сезона. Таймкоды AniSkip требуют проверки. Метки относятся только к этой серии, источнику и длительности видео. Без подтверждённых границ пропуск не выполняется; общий интервал 90 секунд больше не используется." preferredStyle:UIAlertControllerStyleAlert];
+    if (!self.cacheMode && path.row == 7) {
+        UIAlertController* info = [UIAlertController alertControllerWithTitle:@"Точный пропуск опенинга" message:@"AniSkip и автопропуск включены по умолчанию. Во встроенном iOS-плеере приложение ищет сезон в MyAnimeList через Jikan по названию и данным релиза, затем запрашивает op-таймкоды AniSkip для номера и длительности серии. Ввод ID и подтверждение каждой серии не нужны. При неоднозначности, отсутствии разметки или несовпадении длительности пропуска нет. Ручная разметка/привязка остаётся в меню Опенинг. Распознавания звука/видео нет. Отключение сетевого автопоиска не удаляет уже сохранённые метки; чтобы не перематывать, выключи Автопропуск опенинга." preferredStyle:UIAlertControllerStyleAlert];
         [info addAction:[UIAlertAction actionWithTitle:@"ОК" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:info animated:YES completion:nil]; return;
     }

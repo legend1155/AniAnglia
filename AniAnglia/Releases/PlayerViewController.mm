@@ -7,14 +7,25 @@
 #import "StringCvt.h"
 #import <SafariServices/SafariServices.h>
 #include <cctype>
+#include <exception>
 #include <cmath>
 #include <algorithm>
 
 #include "PlaybackPolicy.hpp"
+#include "AnimeMapping.hpp"
 
 static void* PlaybackStatusContext = &PlaybackStatusContext;
 static BOOL PlaybackRealNumber(id value) {
     return [value isKindOfClass:NSNumber.class] && CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID();
+}
+static BOOL PlaybackPositiveInteger(id value, long maximum) {
+    if (!PlaybackRealNumber(value)) return NO;
+    double number = [value doubleValue];
+    return std::isfinite(number) && number >= 1 && number <= maximum && std::floor(number) == number;
+}
+static NSString* PlaybackNormalizedTitle(NSString* title) {
+    NSString* folded = [title stringByFoldingWithOptions:NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch | NSWidthInsensitiveSearch locale:[NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"]];
+    return [[[folded lowercaseString] componentsSeparatedByCharactersInSet:[NSCharacterSet.alphanumericCharacterSet invertedSet]] componentsJoinedByString:@""];
 }
 static NSString* PlaybackTime(double seconds) {
     long whole = (long)std::floor(seconds);
@@ -165,6 +176,14 @@ static NSString* PlaybackTime(double seconds) {
 @property(nonatomic, strong) NSURLSessionDataTask* openingRequest;
 @property(nonatomic) NSUInteger openingRequestVersion;
 @property(nonatomic, copy) NSString* openingStatus;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber*, NSDictionary*>* releaseMetadata;
+@property(nonatomic, copy) NSDictionary<NSNumber*, NSString*>* episodeNames;
+@property(nonatomic) BOOL mappingAttempted;
+@property(nonatomic) NSTimeInterval lastJikanRequest;
+-(NSDictionary*)currentReleaseMetadata;
+-(NSDictionary*)automaticOpeningBinding;
+-(void)resolveAutomaticOpening;
+-(void)requestAnimePage:(NSInteger)page metadata:(NSDictionary*)metadata candidates:(NSArray*)candidates generation:(NSUInteger)generation version:(NSUInteger)version;
 -(NSDictionary*)openingRecord;
 -(NSString*)openingMediaIdentity;
 -(NSDictionary*)openingBinding;
@@ -186,6 +205,158 @@ static NSString* PlaybackTime(double seconds) {
 }
 -(AppSettingsDataController*)settings { return [[AppDataController sharedInstance] getSettingsController]; }
 -(void)setEpisodePositions:(NSArray<NSNumber*>*)positions { self.positions = [positions sortedArrayUsingSelector:@selector(compare:)]; }
+-(void)registerReleaseMetadata:(anixart::Release::Ptr)release {
+    if (!release) return;
+    NSArray* raw = @[TO_NSSTRING(release->title_original) ?: @"", TO_NSSTRING(release->title_alt) ?: @"", TO_NSSTRING(release->title_ru) ?: @""];
+    NSMutableOrderedSet<NSString*>* titles = [NSMutableOrderedSet new];
+    NSString* query = nil;
+    for (NSString* title in raw) {
+        // Split explicit alias separators, not slashes in titles such as Fate/stay night.
+        NSString* separated = [[title stringByReplacingOccurrencesOfString:@" / " withString:@"\n"] stringByReplacingOccurrencesOfString:@" | " withString:@"\n"];
+        for (NSString* alias in [separated componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"\n;" ]]) {
+            NSString* trimmed = [alias stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (!query.length && trimmed.length) query = trimmed;
+            NSString* normalized = PlaybackNormalizedTitle(trimmed);
+            if (normalized.length >= 3) [titles addObject:normalized];
+        }
+    }
+    NSString* yearText = TO_NSSTRING(release->year) ?: @"";
+    NSRegularExpression* yearPattern = [NSRegularExpression regularExpressionWithPattern:@"^[12][0-9]{3}$" options:0 error:NULL];
+    NSInteger year = [yearPattern firstMatchInString:yearText options:0 range:NSMakeRange(0, yearText.length)] ? yearText.integerValue : 0;
+    NSDictionary* metadata = @{@"query": query ?: @"", @"titles": titles.array, @"year": @(year), @"episodes": @(release->episodes_total), @"category": @(static_cast<int>(release->category))};
+    if (!self.releaseMetadata) self.releaseMetadata = [NSMutableDictionary new];
+    if (self.releaseMetadata.count >= 200) [self.releaseMetadata removeAllObjects];
+    self.releaseMetadata[@(static_cast<int64_t>(release->id))] = metadata;
+}
+-(void)setEpisodeNames:(NSDictionary<NSNumber*, NSString*>*)names { _episodeNames = [names copy]; }
+-(NSDictionary*)currentReleaseMetadata { return self.releaseMetadata[@(static_cast<int64_t>(self.release_id))]; }
+-(long)automaticEpisodeForTotal:(long)total {
+    std::vector<long> positions, numbers;
+    NSRegularExpression* pattern = [NSRegularExpression regularExpressionWithPattern:@"^(?:(?:серия|эпизод|episode|ep\\.?)\\s*)?([0-9]{1,6})(?:\\s*(?:серия|эпизод|episode))?$" options:NSRegularExpressionCaseInsensitive error:NULL];
+    for (NSNumber* position in self.positions) {
+        NSString* label = [self.episodeNames[position] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+        NSTextCheckingResult* match = [pattern firstMatchInString:label options:0 range:NSMakeRange(0, label.length)];
+        long number = match ? [[label substringWithRange:[match rangeAtIndex:1]] longLongValue] : (label.length ? -1 : 0);
+        // A literal "0" is a special, not a missing name.
+        positions.push_back(position.longValue); numbers.push_back(match && !number ? -1 : number);
+    }
+    return playback::mappedEpisode(positions, numbers, self.source_position, total);
+}
+-(NSDictionary*)automaticOpeningBinding {
+    if (![[[self settings] getSettingsObjectAtKey:@"aniskip_auto_lookup"] boolValue]) return nil;
+    NSDictionary* metadata = [self currentReleaseMetadata];
+    NSString* key = [NSString stringWithFormat:@"%lld", (long long)static_cast<int64_t>(self.release_id)];
+    id cache = [[NSUserDefaults standardUserDefaults] dictionaryForKey:@"aniskip_mal_cache_v4"][key];
+    if (![cache isKindOfClass:NSDictionary.class] || ![cache[@"metadata"] isEqual:metadata] ||
+        !PlaybackPositiveInteger(cache[@"mal"], 1000000000) || !PlaybackPositiveInteger(cache[@"episodes"], 1000000) || !PlaybackRealNumber(cache[@"saved"])) return nil;
+    double age = NSDate.date.timeIntervalSince1970 - [cache[@"saved"] doubleValue];
+    long mal = [cache[@"mal"] longValue], total = [cache[@"episodes"] longValue];
+    if (!std::isfinite(age) || age < 0 || age > 7 * 86400 || mal <= 0 || mal > 1000000000 || total <= 0) return nil;
+    long episode = [self automaticEpisodeForTotal:total];
+    if (!episode) { self.openingStatus = @"Не удалось однозначно определить номер серии. Можно указать привязку вручную."; return nil; }
+    return @{@"mal": @(mal), @"offset": @(episode - self.source_position), @"automatic": @YES};
+}
+-(void)resolveAutomaticOpening {
+    if (![[[self settings] getSettingsObjectAtKey:@"aniskip_auto_lookup"] boolValue] || self.mappingAttempted) return;
+    self.mappingAttempted = YES;
+    NSDictionary* metadata = [self currentReleaseMetadata];
+    if (!metadata) {
+        NSUInteger generation = self.generation;
+        anixart::ReleaseID releaseID = self.release_id;
+        __block anixart::Release::Ptr release;
+        __weak PlayerController* weakSelf = self;
+        [[LibanixartApi sharedInstance] asyncCall:^BOOL(anixart::Api* api) {
+            release = api->releases().get_release(releaseID); return !release;
+        } completion:^(BOOL errored) {
+            PlayerController* owner = weakSelf;
+            if (!owner || generation != owner.generation) return;
+            if (errored || !release) { owner.openingStatus = @"Не удалось загрузить данные сезона. Просмотр продолжается без автопропуска."; return; }
+            [owner registerReleaseMetadata:release]; owner.mappingAttempted = NO;
+            if (owner.ready) [owner fetchOpeningCandidate];
+        }];
+        return;
+    }
+    if (![metadata[@"query"] length] || ![metadata[@"titles"] count] ||
+        (![metadata[@"year"] intValue] && ![metadata[@"episodes"] intValue]) ||
+        (![metadata[@"category"] intValue] && (![metadata[@"year"] intValue] || ![metadata[@"episodes"] intValue]))) {
+        self.openingStatus = @"Недостаточно данных каталога для безопасного поиска сезона; можно указать MAL ID вручную."; return;
+    }
+    ++self.openingRequestVersion; [self.openingRequest cancel];
+    [self requestAnimePage:1 metadata:metadata candidates:@[] generation:self.generation version:self.openingRequestVersion];
+}
+-(void)requestAnimePage:(NSInteger)page metadata:(NSDictionary*)metadata candidates:(NSArray*)candidates generation:(NSUInteger)generation version:(NSUInteger)version {
+    if (generation != self.generation || version != self.openingRequestVersion || ![[[self settings] getSettingsObjectAtKey:@"aniskip_auto_lookup"] boolValue]) return;
+    // One queue per player, at least 1.1 seconds apart, including repeated manual retries.
+    NSTimeInterval wait = MAX(0, self.lastJikanRequest + 1.1 - NSDate.date.timeIntervalSince1970);
+    if (wait > 0.001) {
+        __weak PlayerController* weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [weakSelf requestAnimePage:page metadata:metadata candidates:candidates generation:generation version:version];
+        }); return;
+    }
+    self.lastJikanRequest = NSDate.date.timeIntervalSince1970;
+    self.openingStatus = @"Автоматический поиск сезона в MyAnimeList через Jikan…";
+    NSURLComponents* components = [NSURLComponents componentsWithString:@"https://api.jikan.moe/v4/anime"];
+    components.queryItems = @[[NSURLQueryItem queryItemWithName:@"q" value:metadata[@"query"]], [NSURLQueryItem queryItemWithName:@"limit" value:@"25"], [NSURLQueryItem queryItemWithName:@"page" value:[@(page) stringValue]]];
+    NSURLRequest* request = [NSURLRequest requestWithURL:components.URL cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:20];
+    __weak PlayerController* weakSelf = self;
+    self.openingRequest = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+        id json = nil;
+        if (!error && [response isKindOfClass:NSHTTPURLResponse.class] && ((NSHTTPURLResponse*)response).statusCode == 200 && data.length && data.length <= 2 * 1024 * 1024)
+            json = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            PlayerController* owner = weakSelf;
+            if (!owner || generation != owner.generation || version != owner.openingRequestVersion) return;
+            owner.openingRequest = nil;
+            if (![[[owner settings] getSettingsObjectAtKey:@"aniskip_auto_lookup"] boolValue]) return;
+            if (![json isKindOfClass:NSDictionary.class] || ![json[@"data"] isKindOfClass:NSArray.class] || ![json[@"pagination"] isKindOfClass:NSDictionary.class] ||
+                ![json[@"pagination"][@"has_next_page"] isKindOfClass:NSNumber.class]) {
+                owner.openingStatus = @"База MyAnimeList недоступна или ограничила запросы. Просмотр продолжается без автопропуска."; return;
+            }
+            NSMutableArray* all = [candidates mutableCopy]; [all addObjectsFromArray:json[@"data"]];
+            if ([json[@"pagination"][@"has_next_page"] boolValue]) {
+                if (page >= 3) { owner.openingStatus = @"Слишком широкий поиск сезона; автоматическая привязка не выбрана."; return; }
+                [owner requestAnimePage:page + 1 metadata:metadata candidates:all generation:generation version:version]; return;
+            }
+            playback::AnimeIdentity source;
+            for (NSString* title in metadata[@"titles"]) source.titles.push_back(TO_STDSTRING(title));
+            source.year = [metadata[@"year"] intValue]; source.episodes = [metadata[@"episodes"] intValue]; source.category = [metadata[@"category"] intValue];
+            std::vector<playback::AnimeIdentity> matches;
+            long total = 0;
+            for (id value in all) {
+                if (![value isKindOfClass:NSDictionary.class]) continue;
+                NSDictionary* row = value;
+                if (!PlaybackPositiveInteger(row[@"mal_id"], 1000000000) || !PlaybackPositiveInteger(row[@"episodes"], 1000000) || ![row[@"type"] isKindOfClass:NSString.class] || ![row[@"titles"] isKindOfClass:NSArray.class]) continue;
+                playback::AnimeIdentity candidate; candidate.mal = [row[@"mal_id"] longValue]; candidate.episodes = [row[@"episodes"] intValue];
+                candidate.year = PlaybackPositiveInteger(row[@"year"], 9999) ? [row[@"year"] intValue] : 0;
+                // Jikan's year is null for many OVA/ONA entries. aired.from is the premiere year.
+                if (!candidate.year && [row[@"aired"] isKindOfClass:NSDictionary.class] && [row[@"aired"][@"from"] isKindOfClass:NSString.class]) {
+                    NSString* date = row[@"aired"][@"from"]; if (date.length >= 4) candidate.year = [[date substringToIndex:4] intValue];
+                }
+                NSString* type = row[@"type"];
+                candidate.category = [@[@"TV", @"ONA"] containsObject:type] ? 1 : ([type isEqual:@"Movie"] ? 2 : ([@[@"OVA", @"Special", @"TV Special"] containsObject:type] ? 3 : 0));
+                // Anixart may classify an ONA as OVA; only allow this where the source explicitly says OVA.
+                if (source.category == 3 && [type isEqual:@"ONA"]) candidate.category = 3;
+                for (id titleRow in row[@"titles"]) if ([titleRow isKindOfClass:NSDictionary.class] && [titleRow[@"title"] isKindOfClass:NSString.class]) {
+                    NSString* title = PlaybackNormalizedTitle(titleRow[@"title"]); if (title.length) candidate.titles.push_back(TO_STDSTRING(title));
+                }
+                matches.push_back(candidate);
+            }
+            long mal = playback::uniqueAnime(source, matches, true);
+            for (const auto& candidate : matches) if (candidate.mal == mal) total = candidate.episodes;
+            if (!mal || total <= 0) { owner.openingStatus = @"Сезон не найден однозначно по названию, году, формату и числу серий. Случайный результат не используется."; return; }
+            NSMutableDictionary* cache = [[[NSUserDefaults standardUserDefaults] dictionaryForKey:@"aniskip_mal_cache_v4"] mutableCopy] ?: [NSMutableDictionary new];
+            NSString* key = [NSString stringWithFormat:@"%lld", (long long)static_cast<int64_t>(owner.release_id)];
+            // Bounded positive cache; failures are not persisted.
+            if (cache.count >= 200) [cache removeAllObjects];
+            cache[key] = @{@"metadata": metadata, @"mal": @(mal), @"episodes": @(total), @"saved": @(NSDate.date.timeIntervalSince1970)};
+            [[NSUserDefaults standardUserDefaults] setObject:cache forKey:@"aniskip_mal_cache_v4"];
+            if ([owner automaticOpeningBinding]) [owner fetchOpeningCandidate];
+        });
+    }];
+    [self.openingRequest resume];
+}
+
 -(NSNumber*)nextPosition {
     std::vector<long> positions;
     for (NSNumber* item in self.positions) positions.push_back(item.longValue);
@@ -250,7 +421,7 @@ static NSString* PlaybackTime(double seconds) {
 -(void)playWithReleaseID:(anixart::ReleaseID)release_id sourceID:(anixart::EpisodeSourceID)source_id position:(long)position autoShow:(BOOL)auto_show completion:(void(^)(BOOL))completion {
     [self stopObserving];
     self.release_id = release_id; self.source_id = source_id; self.source_position = position;
-    self.targetURL = nil;
+    self.targetURL = nil; self.mappingAttempted = NO;
     self.progressKey = [NSString stringWithFormat:@"%lld:%lld:%lld:%ld", (long long)static_cast<int64_t>([[AppDataController sharedInstance] getMyProfileID]), (long long)static_cast<int64_t>(release_id), (long long)static_cast<int64_t>(source_id), position];
     self.advancing = NO; self.openingHandled = NO; self.episodeCompleted = NO; self.errorShown = NO;
     self.pendingOpeningStart = -1; self.previewingOpening = NO; self.openingCandidate = nil; self.openingStatus = @"";
@@ -382,11 +553,11 @@ static NSString* PlaybackTime(double seconds) {
     NSString* key = [self openingBindingKey];
     if (!key) return nil;
     id value = [[NSUserDefaults standardUserDefaults] dictionaryForKey:@"opening_mal_bindings"][key];
-    if (![value isKindOfClass:NSDictionary.class]) return nil;
+    if (![value isKindOfClass:NSDictionary.class]) return [self automaticOpeningBinding];
     NSDictionary* binding = value;
-    if (!PlaybackRealNumber(binding[@"mal"]) || !PlaybackRealNumber(binding[@"offset"])) return nil;
+    if (!PlaybackRealNumber(binding[@"mal"]) || !PlaybackRealNumber(binding[@"offset"])) return [self automaticOpeningBinding];
     double mal = [binding[@"mal"] doubleValue], offset = [binding[@"offset"] doubleValue];
-    if (!std::isfinite(mal) || mal < 1 || mal > 1000000000 || std::floor(mal) != mal || !std::isfinite(offset) || std::abs(offset) > 1000000 || std::floor(offset) != offset) return nil;
+    if (!std::isfinite(mal) || mal < 1 || mal > 1000000000 || std::floor(mal) != mal || !std::isfinite(offset) || std::abs(offset) > 1000000 || std::floor(offset) != offset) return [self automaticOpeningBinding];
     return binding;
 }
 -(void)presentOpeningAlert:(UIAlertController*)alert {
@@ -449,11 +620,11 @@ static NSString* PlaybackTime(double seconds) {
     }]];
     if (self.openingCandidate) [menu addAction:[UIAlertAction actionWithTitle:@"Проверить таймкоды AniSkip" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
         if (generation != self.generation) return; [self reviewOpeningCandidate]; }]];
-    [menu addAction:[UIAlertAction actionWithTitle:[self openingBinding] ? @"Запросить таймкоды AniSkip" : @"Настроить AniSkip (необязательно)" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+    [menu addAction:[UIAlertAction actionWithTitle:@"Повторить автопоиск / запрос AniSkip" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
         if (generation != self.generation) return;
-        if ([self openingBinding]) [self fetchOpeningCandidate]; else [self configureOpeningBinding];
+        self.mappingAttempted = NO; [self fetchOpeningCandidate];
     }]];
-    if ([self openingBinding]) [menu addAction:[UIAlertAction actionWithTitle:@"Изменить / отключить AniSkip" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+    [menu addAction:[UIAlertAction actionWithTitle:@"MAL ID вручную (необязательно)" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
         if (generation != self.generation) return; [self configureOpeningBinding]; }]];
     if (record) [menu addAction:[UIAlertAction actionWithTitle:@"Удалить границы этой серии" style:UIAlertActionStyleDestructive handler:^(UIAlertAction* action) {
         if (generation != self.generation) return;
@@ -493,10 +664,23 @@ static NSString* PlaybackTime(double seconds) {
     [editor addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentOpeningAlert:editor];
 }
+-(void)invalidateFetchedOpenings {
+    NSString* prefix = [[self openingBindingKey] stringByAppendingString:@":"];
+    if (!prefix.length) return;
+    NSMutableDictionary* records = [[[NSUserDefaults standardUserDefaults] dictionaryForKey:@"episode_openings_v3"] mutableCopy];
+    for (NSString* key in records.allKeys) {
+        id record = records[key];
+        if ([key hasPrefix:prefix] && [record isKindOfClass:NSDictionary.class] &&
+            [record[@"origin"] isKindOfClass:NSString.class] && [record[@"origin"] hasPrefix:@"AniSkip-"]) [records removeObjectForKey:key];
+    }
+    if (records) [[NSUserDefaults standardUserDefaults] setObject:records forKey:@"episode_openings_v3"];
+    [self installOpeningBoundaries];
+    [self updatePlaybackAt:CMTimeGetSeconds(self.observedPlayer.currentTime)];
+}
 -(void)configureOpeningBinding {
     NSUInteger generation = self.generation;
     NSDictionary* binding = [self openingBinding];
-    UIAlertController* editor = [UIAlertController alertControllerWithTitle:@"Привязка AniSkip" message:@"Нужен MyAnimeList ID именно этого сезона и номер текущей серии в нём. ID Anixart сюда не подходит. В AniSkip отправляются только MAL ID, номер и длительность серии — не видео и не токен. Пустой MAL ID отключает запросы. Полученные границы требуют проверки для каждой серии." preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController* editor = [UIAlertController alertControllerWithTitle:@"Привязка AniSkip" message:@"Необязательная ручная поправка к автоматическому поиску: MyAnimeList ID этого сезона и номер текущей серии в нём. ID Anixart не подходит. Пустое поле удаляет ручную поправку и возвращает автопоиск; сеть можно отключить в настройках AniSkip. Подходящие таймкоды применяются автоматически." preferredStyle:UIAlertControllerStyleAlert];
     [editor addTextFieldWithConfigurationHandler:^(UITextField* field) {
         field.placeholder = @"MyAnimeList ID сезона"; field.text = binding ? [binding[@"mal"] stringValue] : @""; field.keyboardType = UIKeyboardTypeNumberPad;
     }];
@@ -514,7 +698,8 @@ static NSString* PlaybackTime(double seconds) {
         ++self.openingRequestVersion; [self.openingRequest cancel]; self.openingCandidate = nil;
         if (!mal.length) {
             [bindings removeObjectForKey:key]; [[NSUserDefaults standardUserDefaults] setObject:bindings forKey:@"opening_mal_bindings"];
-            self.openingStatus = @"AniSkip отключён. Локальная разметка остаётся."; return;
+            [self invalidateFetchedOpenings];
+            self.mappingAttempted = NO; self.openingStatus = @"Ручная привязка удалена. Восстановлен автоматический поиск."; [self fetchOpeningCandidate]; return;
         }
         NSCharacterSet* invalid = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet];
         if (mal.length > 9 || !episode.length || episode.length > 6 || [mal rangeOfCharacterFromSet:invalid].location != NSNotFound ||
@@ -523,6 +708,7 @@ static NSString* PlaybackTime(double seconds) {
         }
         bindings[key] = @{@"mal": @(mal.longLongValue), @"offset": @(episode.longLongValue - self.source_position)};
         [[NSUserDefaults standardUserDefaults] setObject:bindings forKey:@"opening_mal_bindings"];
+        [self invalidateFetchedOpenings];
         [self fetchOpeningCandidate];
     }]];
     [editor addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
@@ -531,7 +717,9 @@ static NSString* PlaybackTime(double seconds) {
 -(void)fetchOpeningCandidate {
     NSDictionary* binding = [self openingBinding];
     double duration = CMTimeGetSeconds(self.observedItem.duration);
-    if (!binding || !self.ready || !std::isfinite(duration) || duration <= 0) return;
+    if (!self.ready || !self.progressKey || !std::isfinite(duration) || duration <= 0) return;
+    if (!binding) { [self resolveAutomaticOpening]; return; }
+    if (![[[self settings] getSettingsObjectAtKey:@"aniskip_auto_lookup"] boolValue]) { self.openingStatus = @"Сетевые запросы AniSkip отключены в настройках."; return; }
     long episode = self.source_position + [binding[@"offset"] longValue];
     if (episode < 1 || episode > 1000000) { self.openingStatus = @"Номер серии вне привязки MAL. Проверь настройки."; return; }
     ++self.openingRequestVersion; [self.openingRequest cancel]; self.openingCandidate = nil;
@@ -545,7 +733,7 @@ static NSString* PlaybackTime(double seconds) {
     self.openingRequest = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
         NSDictionary* candidate = nil;
         if (!error && [response isKindOfClass:NSHTTPURLResponse.class] && ((NSHTTPURLResponse*)response).statusCode == 200 && data.length && data.length <= 1024 * 1024) {
-            id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
             if ([json isKindOfClass:NSDictionary.class] && [json[@"results"] isKindOfClass:NSArray.class]) {
                 NSMutableArray<NSDictionary*>* compatible = [NSMutableArray new];
                 for (id value in json[@"results"]) {
@@ -563,8 +751,17 @@ static NSString* PlaybackTime(double seconds) {
         dispatch_async(dispatch_get_main_queue(), ^{
             PlayerController* owner = weakSelf;
             if (!owner || generation != owner.generation || requestVersion != owner.openingRequestVersion) return;
-            owner.openingRequest = nil; owner.openingCandidate = candidate;
-            owner.openingStatus = candidate ? @"Найдены границы AniSkip. Просмотри и подтверди для этой серии — до подтверждения они не применяются." : @"Нет однозначных подходящих таймкодов или сервис недоступен. Общий таймер не используется; можно разметить вручную.";
+            owner.openingRequest = nil;
+            if (![[[owner settings] getSettingsObjectAtKey:@"aniskip_auto_lookup"] boolValue]) return;
+            // Never overwrite the user's local correction or interrupt marking/preview.
+            if (candidate && ![owner openingRecord] && owner.pendingOpeningStart < 0 && !owner.previewingOpening) {
+                [owner storeOpeningFrom:[candidate[@"start"] doubleValue] to:[candidate[@"end"] doubleValue] origin:@"AniSkip-auto"];
+                owner.openingStatus = @"AniSkip: границы найдены и применены автоматически.";
+            } else if (candidate && ![owner openingRecord]) {
+                owner.openingCandidate = candidate; owner.openingStatus = @"Таймкоды доступны; ручная разметка имеет приоритет.";
+            } else if (!candidate) {
+                owner.openingStatus = @"Нет подходящих таймкодов AniSkip или сервис недоступен. Без меток пропуск не выполняется.";
+            }
             [owner updatePlaybackAt:CMTimeGetSeconds(owner.observedPlayer.currentTime)];
         });
     }];

@@ -1,4 +1,5 @@
 #include "PlaybackPolicy.hpp"
+#include "AnimeMapping.hpp"
 #include <cassert>
 #include <iostream>
 #include <limits>
@@ -87,5 +88,48 @@ int main() {
     check(parseTimestamp("99999999999999999999") == -1);
     check(parseTimestamp("24:00:00") == 86400);
     check(parseTimestamp("24:00:01") == -1);
+    AnimeIdentity show{0, {"cowboybebop", "カウボーイビバップ"}, 1998, 26, 1};
+    AnimeIdentity candidate{1, {"cowboybebop"}, 1998, 26, 1};
+    check(matchingAnime(show, candidate));
+    check(uniqueAnime(show, {candidate}, true) == 1);
+    check(uniqueAnime(show, {}, true) == 0);
+    check(uniqueAnime(show, {candidate}, false) == 0); // incomplete pagination
+    check(uniqueAnime(show, {candidate, candidate}, true) == 1); // de-duplicate one ID
+    auto other = candidate; other.mal = 2;
+    check(uniqueAnime(show, {candidate, other}, true) == 0); // ambiguous, never first result
+    other.year = 1999;
+    check(uniqueAnime(show, {other, candidate}, true) == 1);
+    check(!matchingAnime(show, other));
+    other = candidate; other.episodes = 25; check(!matchingAnime(show, other));
+    other = candidate; other.category = 2; check(!matchingAnime(show, other));
+    other = candidate; other.titles = {"cowboybebop2"}; check(!matchingAnime(show, other));
+    other = candidate; other.mal = 0; check(!matchingAnime(show, other));
+    other = candidate; other.mal = 1000000001; check(!matchingAnime(show, other));
+    other = candidate; other.year = 0; check(!matchingAnime(show, other));
+    other = candidate; other.episodes = 0; check(!matchingAnime(show, other));
+    auto unknown = show; unknown.year = 0; unknown.episodes = 0;
+    check(!matchingAnime(unknown, candidate));
+    unknown = show; unknown.category = 0; check(matchingAnime(unknown, candidate));
+    unknown.year = 0; check(!matchingAnime(unknown, candidate));
+    unknown = show; unknown.titles = {"カウボーイビバップ"};
+    other = candidate; other.titles = {"カウボーイビバップ"}; check(matchingAnime(unknown, other));
+    check(mappedEpisode({1,2,3}, {1,2,3}, 2, 12) == 2);
+    check(mappedEpisode({0,1,2}, {1,2,3}, 1, 12) == 2); // explicit zero-based mapping
+    check(mappedEpisode({13,14}, {1,2}, 14, 12) == 2); // explicit season labels
+    check(mappedEpisode({0,1,2}, {0,0,0}, 1, 12) == 0); // don't guess zero-based
+    check(mappedEpisode({1,2,3}, {0,0,0}, 3, 12) == 3);
+    check(mappedEpisode({3,1,2}, {0,0,0}, 2, 12) == 2); // UI sort irrelevant
+    check(mappedEpisode({1,3}, {0,0}, 3, 12) == 0); // incomplete ambiguous list
+    check(mappedEpisode({1,2}, {0,-1}, 1, 12) == 0); // named special disables inference
+    check(mappedEpisode({1,2}, {1,-1}, 1, 12) == 1); // named regular episode still valid
+    check(mappedEpisode({1,2}, {1,-1}, 2, 12) == 0);
+    check(mappedEpisode({1,2}, {1,1}, 1, 12) == 0); // duplicate episode names
+    check(mappedEpisode({1,1}, {1,2}, 1, 12) == 0); // duplicate positions
+    check(mappedEpisode({1}, {1}, 1, 0) == 0);
+    check(mappedEpisode({1}, {13}, 1, 12) == 0);
+    check(mappedEpisode({1}, {}, 1, 12) == 0);
+    check(mappedEpisode({}, {}, 1, 12) == 0);
+    check(mappedEpisode({1}, {1}, 2, 12) == 0);
+    check(mappedEpisode({1,2,3}, {0,0,0}, 2, 2) == 0); // beyond MAL season size
     std::cout << "PASS: " << total << " playback policy checks (production C++ header).\n";
 }

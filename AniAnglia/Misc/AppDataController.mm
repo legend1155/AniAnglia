@@ -31,7 +31,8 @@
         app_settings::Playback::default_skip_time: @90,
         app_settings::Playback::auto_next_video: @(NO),
         app_settings::Playback::remember_source: @(YES),
-        @"auto_skip_opening": @NO,
+        @"auto_skip_opening": @YES,
+        @"aniskip_auto_lookup": @YES,
         @"auto_skip_ending": @NO,
         @"ending_skip_time": @90,
         @"known_source_names": @[],
@@ -53,6 +54,14 @@
     _settings_dict = [[AppSettingsDataController getDefaults] mutableCopy];
     NSDictionary* saved = [_user_defaults dictionaryForKey:@"settings"];
     if (saved) [_settings_dict addEntriesFromDictionary:saved];
+    // v3 required opt-in/manual confirmation. v4 enables the requested automatic mode once.
+    // Subsequent user choices are preserved across launches.
+    if (![_user_defaults boolForKey:@"aniskip_v4_migrated"]) {
+        _settings_dict[@"auto_skip_opening"] = @YES;
+        _settings_dict[@"aniskip_auto_lookup"] = @YES;
+        [_user_defaults setObject:_settings_dict forKey:@"settings"];
+        [_user_defaults setBool:YES forKey:@"aniskip_v4_migrated"];
+    }
     
     return self;
 }

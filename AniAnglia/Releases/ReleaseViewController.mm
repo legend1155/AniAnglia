@@ -12,6 +12,7 @@
 #import "AppDataController.h"
 #import "StringCvt.h"
 #import "TypeSelectViewController.h"
+#import "PlayerViewController.h"
 #import "LoadableView.h"
 #import "TimeCvt.h"
 #import "DynamicTableView.h"
@@ -1237,6 +1238,7 @@
 }
 
 -(IBAction)onPlayButtonPressed:(UIButton*)sender {
+    [[PlayerController sharedInstance] registerReleaseMetadata:_release];
     [self.navigationController pushViewController:[[TypeSelectViewController alloc] initWithReleaseID:_release->id] animated:YES];
 }
 -(IBAction)onBookmarkButtonPressed:(UIButton*)sender {
