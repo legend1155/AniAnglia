@@ -258,7 +258,9 @@
 }
 
 -(void)cellDownloadButtonActionPressed:(NSIndexPath*)index_path {
-    NSLog(@"cellDownloadButtonActionPressed:%@", index_path);
+    UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"Офлайн-загрузка пока недоступна" message:@"Кеш в настройках сохраняет изображения, но не видео." preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"ОК" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 -(void)cellChangeViewedActionPressed:(NSIndexPath*)index_path {
     NSInteger index = [index_path item];

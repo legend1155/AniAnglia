@@ -180,6 +180,13 @@
     } completion:^(BOOL errored) {
         [self->_loadable_view endLoadingWithErrored:errored];
         if (!errored) {
+            AppSettingsDataController* settings = [[AppDataController sharedInstance] getSettingsController];
+            NSMutableSet<NSString*>* known = [NSMutableSet setWithArray:[settings getSettingsObjectAtKey:@"known_source_names"] ?: @[]];
+            for (const auto& source : self->_sources) {
+                NSString* name = TO_NSSTRING(source->name);
+                if (name.length) [known addObject:name];
+            }
+            [settings setSettingsObject:[[known allObjects] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)] atKey:@"known_source_names"];
             [self sortItems];
             [self setup];
             [self setupLayout];

@@ -1,24 +1,20 @@
-"""Compile the actual pure-C++ quality selector from PlayerViewController.mm."""
+"""Portable logic tests only. Not an iOS build or an AVKit UI test."""
 from pathlib import Path
-import subprocess, tempfile
+import os, shutil, subprocess, tempfile
 root = Path(__file__).resolve().parents[1]
-src = (root / 'AniAnglia/Releases/PlayerViewController.mm').read_text()
-function = src[src.index('std::string choose_quality'):src.index('@interface PlayerViewController')]
-cases = r'''
-int main() {
- using Q = std::unordered_map<std::string, std::string>;
- assert(choose_quality(Q{}, "720").empty());
- assert(choose_quality(Q{{"720", "a"}, {"1080", "b"}}, "720") == "a");
- assert(choose_quality(Q{{"720p", "a"}, {"1080p", "b"}}, "480") == "b");
- assert(choose_quality(Q{{"auto", "a"}, {"hls", "b"}}, "720") == "a");
- assert(choose_quality(Q{{"720", ""}, {"480", "b"}}, "720") == "b");
- assert(choose_quality(Q{{"999999999999999999999999999999", "a"}}, "720") == "a");
- assert(choose_quality(Q{{"720", "a"}}, std::string_view("720xxxx", 3)) == "a");
-}
-'''
+compiler = os.environ.get('CXX') or shutil.which('g++') or shutil.which('clang++')
+if not compiler:
+    raise SystemExit('A C++20 compiler (g++ or clang++) is required')
 with tempfile.TemporaryDirectory() as temp:
- path = Path(temp) / 'test.cpp'
- path.write_text('#include <string>\n#include <string_view>\n#include <unordered_map>\n#include <cctype>\n#include <algorithm>\n#include <cassert>\n' + function + cases)
- subprocess.run(['g++', '-std=c++20', '-Wall', '-Wextra', '-Werror', str(path), '-o', temp+'/test'], check=True)
- subprocess.run([temp+'/test'], check=True)
-print('PASS: 7 quality-selector cases (actual production function). iOS build not tested.')
+    binary = str(Path(temp) / 'playback-test')
+    subprocess.run([compiler, '-std=c++20', '-Wall', '-Wextra', '-Werror',
+        '-I'+str(root/'AniAnglia/Releases'), str(root/'tests/playback_policy_test.cpp'), '-o', binary], check=True)
+    subprocess.run([binary], check=True)
+player = (root/'AniAnglia/Releases/PlayerViewController.mm').read_text()
+assert '.pictureInPictureActive' not in player, 'Regression: property does not exist on AVPlayerViewController'
+assert '@interface PlayerViewController : UIViewController' in player
+assert 'playerViewControllerWillStartPictureInPicture:' in player
+assert 'failedToStartPictureInPictureWithError:' in player
+assert '[self.view addSubview:control]' in player
+assert 'playback::openingTarget' in player and 'playback::nextPosition' in player
+print('PASS: source regression checks; iOS compilation and device UI still require Xcode/iPhone.')

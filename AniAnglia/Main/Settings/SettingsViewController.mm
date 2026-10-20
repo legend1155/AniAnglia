@@ -16,6 +16,70 @@
 #import "SettingsAppearanceViewController.h"
 #import "SettingsSecurityViewController.h"
 
+// An actual searchable preference picker instead of requiring an exact typed voice name.
+@interface PlaybackChoiceViewController : UITableViewController <UISearchResultsUpdating>
+@property(nonatomic, copy) NSString* preferenceKey;
+@property(nonatomic, copy) NSArray<NSString*>* names;
+@property(nonatomic, copy) NSArray<NSString*>* filtered;
+@property(nonatomic, strong) UISearchController* search;
+@property(nonatomic) BOOL loadingFailed;
+@end
+@implementation PlaybackChoiceViewController
+-(void)viewDidLoad {
+    [super viewDidLoad]; self.names = @[]; self.filtered = @[];
+    self.search = [[UISearchController alloc] initWithSearchResultsController:nil];
+    self.search.searchResultsUpdater = self; self.search.obscuresBackgroundDuringPresentation = NO;
+    self.navigationItem.searchController = self.search; self.definesPresentationContext = YES;
+    if ([self.preferenceKey isEqualToString:@"preferred_type_name"]) {
+        [self loadVoices];
+    } else {
+        self.names = [[[AppDataController sharedInstance] getSettingsController] getSettingsObjectAtKey:@"known_source_names"] ?: @[];
+        self.filtered = self.names; [self.tableView reloadData];
+    }
+}
+-(void)loadVoices {
+    self.loadingFailed = NO;
+    UIActivityIndicatorView* spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    spinner.frame = CGRectMake(0, 0, 44, 44); [spinner startAnimating]; self.tableView.tableFooterView = spinner;
+    __block NSMutableSet<NSString*>* names = [NSMutableSet new];
+    [[LibanixartApi sharedInstance] asyncCall:^BOOL(anixart::Api* api) {
+        for (const auto& voice : api->episodes().get_all_types()) {
+            NSString* name = TO_NSSTRING(voice->name); if (name.length) [names addObject:name];
+        }
+        return NO;
+    } completion:^(BOOL errored) {
+        self.tableView.tableFooterView = nil; self.loadingFailed = errored;
+        if (!errored) self.names = [[names allObjects] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+        [self updateSearchResultsForSearchController:self.search];
+    }];
+}
+-(void)updateSearchResultsForSearchController:(UISearchController*)search {
+    NSString* query = search.searchBar.text ?: @"";
+    self.filtered = query.length ? [self.names filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(id object, NSDictionary* bindings) { NSString* name = object; return [name localizedCaseInsensitiveContainsString:query]; }]] : self.names;
+    [self.tableView reloadData];
+}
+-(NSInteger)tableView:(UITableView*)tableView numberOfRowsInSection:(NSInteger)section { return 1 + self.filtered.count + (self.loadingFailed ? 1 : 0); }
+-(NSString*)tableView:(UITableView*)tableView titleForFooterInSection:(NSInteger)section {
+    return [self.preferenceKey isEqualToString:@"preferred_source_name"] ? @"Источники появятся после открытия списка источников любого аниме. Если выбранного варианта нет у релиза, приложение предложит ручной выбор." : @"Если озвучка недоступна у релиза, приложение предложит ручной выбор.";
+}
+-(UITableViewCell*)tableView:(UITableView*)tableView cellForRowAtIndexPath:(NSIndexPath*)path {
+    UITableViewCell* cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    if (self.loadingFailed && path.row == self.filtered.count + 1) { cell.textLabel.text = @"Ошибка загрузки — повторить"; return cell; }
+    NSString* name = path.row == 0 ? @"" : self.filtered[path.row - 1];
+    cell.textLabel.text = name.length ? name : @"Выбирать вручную";
+    NSString* saved = [[[AppDataController sharedInstance] getSettingsController] getSettingsObjectAtKey:self.preferenceKey];
+    cell.accessoryType = [name isEqualToString:saved] ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    return cell;
+}
+-(void)tableView:(UITableView*)tableView didSelectRowAtIndexPath:(NSIndexPath*)path {
+    [tableView deselectRowAtIndexPath:path animated:YES];
+    if (self.loadingFailed && path.row == self.filtered.count + 1) { [self loadVoices]; return; }
+    NSString* name = path.row == 0 ? @"" : self.filtered[path.row - 1];
+    [[[AppDataController sharedInstance] getSettingsController] setSettingsObject:name atKey:self.preferenceKey];
+    [self.navigationController popViewControllerAnimated:YES];
+}
+@end
+
 // Playback preferences and image cache controls share the existing settings target.
 @interface PlaybackSettingsViewController : UITableViewController
 @property(nonatomic) BOOL cacheMode;
@@ -27,7 +91,11 @@
     self.settings = [[AppDataController sharedInstance] getSettingsController];
     self.title = self.cacheMode ? @"Кеш изображений" : @"Воспроизведение";
 }
--(NSInteger)tableView:(UITableView*)tableView numberOfRowsInSection:(NSInteger)section { return self.cacheMode ? 2 : 10; }
+-(void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self.tableView reloadData]; }
+-(NSString*)tableView:(UITableView*)tableView titleForFooterInSection:(NSInteger)section {
+    return self.cacheMode ? @"Кеш только изображений, с учётом HTTP-политики сервера. Видео для офлайн-просмотра не сохраняются." : @"Skip, прогресс и автоматические переходы работают во встроенном iOS-плеере. В веб-плеере ими управляет сайт. Опенинг задаётся общим интервалом, без распознавания. Пропуск конца серии — отдельная настройка перехода до титров.";
+}
+-(NSInteger)tableView:(UITableView*)tableView numberOfRowsInSection:(NSInteger)section { return self.cacheMode ? 2 : 12; }
 -(UITableViewCell*)tableView:(UITableView*)tableView cellForRowAtIndexPath:(NSIndexPath*)path {
     UITableViewCell* cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
     if (self.cacheMode) {
@@ -35,10 +103,10 @@
         if (!path.row) cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld МБ", (long)[self.settings getMaxCacheSizeBytes]/1024/1024];
         return cell;
     }
-    NSArray* titles = @[@"Плеер", @"Качество", @"Озвучка по умолчанию", @"Источник по умолчанию", @"Запоминать выбор", @"Следующая серия автоматически", @"Автопропуск опенинга", @"Начало опенинга (сек.)", @"Длительность опенинга (сек.)", @"Сбросить прогресс просмотра"];
+    NSArray* titles = @[@"Плеер", @"Качество", @"Озвучка по умолчанию", @"Источник по умолчанию", @"Запоминать выбор", @"Следующая серия автоматически", @"Автопропуск опенинга", @"Начало опенинга (сек.)", @"Длительность опенинга (сек.)", @"Пропускать конец серии", @"Последние секунды до перехода", @"Сбросить прогресс просмотра"];
     cell.textLabel.text = titles[path.row];
-    NSArray* keys = @[@"default_player", @"preffered_quality", @"preferred_type_name", @"preferred_source_name", @"remember_source", @"auto_next_video", @"auto_skip_opening", @"opening_start", @"default_skip_time"];
-    if (path.row >= 4 && path.row <= 6) {
+    NSArray* keys = @[@"default_player", @"preffered_quality", @"preferred_type_name", @"preferred_source_name", @"remember_source", @"auto_next_video", @"auto_skip_opening", @"opening_start", @"default_skip_time", @"auto_skip_ending", @"ending_skip_time"];
+    if ((path.row >= 4 && path.row <= 6) || path.row == 9) {
         UISwitch* toggle = [UISwitch new]; toggle.tag = path.row;
         toggle.on = [[self.settings getSettingsObjectAtKey:keys[path.row]] boolValue];
         [toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
@@ -51,7 +119,8 @@
 }
 -(void)toggleChanged:(UISwitch*)sender {
     NSArray* keys = @[@"remember_source", @"auto_next_video", @"auto_skip_opening"];
-    [self.settings setSettingsObject:@(sender.on) atKey:keys[sender.tag - 4]];
+    NSString* key = sender.tag == 9 ? @"auto_skip_ending" : keys[sender.tag - 4];
+    [self.settings setSettingsObject:@(sender.on) atKey:key];
 }
 -(void)tableView:(UITableView*)tableView didSelectRowAtIndexPath:(NSIndexPath*)path {
     [tableView deselectRowAtIndexPath:path animated:YES];
@@ -59,14 +128,20 @@
         [[NSURLCache sharedURLCache] removeAllCachedResponses];
         [tableView reloadData]; return;
     }
-    if (!self.cacheMode && path.row >= 4 && path.row <= 6) return;
-    if (!self.cacheMode && path.row == 9) {
+    if (!self.cacheMode && ((path.row >= 4 && path.row <= 6) || path.row == 9)) return;
+    if (!self.cacheMode && (path.row == 2 || path.row == 3)) {
+        PlaybackChoiceViewController* choices = [[PlaybackChoiceViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        choices.preferenceKey = path.row == 2 ? @"preferred_type_name" : @"preferred_source_name";
+        choices.title = path.row == 2 ? @"Озвучка по умолчанию" : @"Источник по умолчанию";
+        [self.navigationController pushViewController:choices animated:YES]; return;
+    }
+    if (!self.cacheMode && path.row == 11) {
         UIAlertController* confirm = [UIAlertController alertControllerWithTitle:@"Удалить сохранённый прогресс?" message:nil preferredStyle:UIAlertControllerStyleAlert];
         [confirm addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
         [confirm addAction:[UIAlertAction actionWithTitle:@"Удалить" style:UIAlertActionStyleDestructive handler:^(UIAlertAction* action) { [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"playback_progress"]; }]];
         [self presentViewController:confirm animated:YES completion:nil]; return;
     }
-    NSString* key = self.cacheMode ? @"max_cache_size" : (@[@"default_player", @"preffered_quality", @"preferred_type_name", @"preferred_source_name", @"", @"", @"", @"opening_start", @"default_skip_time"])[path.row];
+    NSString* key = self.cacheMode ? @"max_cache_size" : (@[@"default_player", @"preffered_quality", @"preferred_type_name", @"preferred_source_name", @"", @"", @"", @"opening_start", @"default_skip_time", @"", @"ending_skip_time"])[path.row];
     NSArray* values = self.cacheMode ? @[@0, @10, @50, @100, @250] : (path.row == 0 ? @[@1, @2] : (path.row == 1 ? @[@"360", @"480", @"720", @"1080"] : nil));
     UIAlertController* alert = [UIAlertController alertControllerWithTitle:[tableView cellForRowAtIndexPath:path].textLabel.text message:nil preferredStyle:UIAlertControllerStyleAlert];
     if (values) {
@@ -78,8 +153,10 @@
             }]];
         }
     } else {
-        alert.message = path.row == 2 || path.row == 3 ? @"Точное название из списка. Пустое значение — ручной выбор. Также можно выбрать один раз в списке." : @"Опенинг пропускается по заданному интервалу, без распознавания.";
-        [alert addTextFieldWithConfigurationHandler:^(UITextField* field) { field.text = [[self.settings getSettingsObjectAtKey:key] description]; }];
+        alert.message = path.row == 10 ? @"За столько секунд до конца перейти к следующей серии, если включён пропуск конца. Последняя серия не обрывается." : @"Опенинг пропускается по заданному интервалу, без распознавания.";
+        [alert addTextFieldWithConfigurationHandler:^(UITextField* field) {
+            field.text = [[self.settings getSettingsObjectAtKey:key] description]; field.keyboardType = UIKeyboardTypeNumberPad;
+        }];
         [alert addAction:[UIAlertAction actionWithTitle:@"Сохранить" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
             NSString* text = alert.textFields.firstObject.text ?: @"";
             id value = text;
