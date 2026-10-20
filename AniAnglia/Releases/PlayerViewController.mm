@@ -1,6 +1,7 @@
 // Native playback lifecycle, resume, queue and source web fallback.
 #import "PlayerViewController.h"
 #import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
 #import <AVFAudio/AVFAudio.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import "AppDataController.h"

@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		AA1041000000000000000001 /* CoreMedia.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA1041000000000000000002 /* CoreMedia.framework */; };
 		AA1020000000000000000001 /* SafariServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA1020000000000000000002 /* SafariServices.framework */; };
 		EF0D7D192D26F0E7000E516A /* libanixart.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = EF0D7D182D26F0E7000E516A /* libanixart.xcframework */; };
 		EF15C9222DF8582100335578 /* NamedSectionView.mm in Sources */ = {isa = PBXBuildFile; fileRef = EF15C9212DF8582100335578 /* NamedSectionView.mm */; };
@@ -99,6 +100,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		AA1041000000000000000002 /* CoreMedia.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreMedia.framework; path = System/Library/Frameworks/CoreMedia.framework; sourceTree = SDKROOT; };
 		AA1020000000000000000002 /* SafariServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SafariServices.framework; path = System/Library/Frameworks/SafariServices.framework; sourceTree = SDKROOT; };
 		EF0D7D182D26F0E7000E516A /* libanixart.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libanixart.xcframework; path = AniAnglia/Libraries/aateam/libanixart/libanixart.xcframework; sourceTree = "<group>"; };
 		EF0D7D1C2D26F0F9000E516A /* libtorrentrepo.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = libtorrentrepo.xcframework; path = AniAnglia/Libraries/aateam/libtorrentrepo/libtorrentrepo.xcframework; sourceTree = "<group>"; };
@@ -1426,6 +1428,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA1041000000000000000001 /* CoreMedia.framework in Frameworks */,
 				AA1020000000000000000001 /* SafariServices.framework in Frameworks */,
 				EFD5CD772CDABD3800A1E057 /* curl.xcframework in Frameworks */,
 				EF4941152C723F8600832A6C /* CoreGraphics.framework in Frameworks */,
@@ -3546,6 +3549,7 @@
 		EFAB992D2C6FF833008208E2 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				AA1041000000000000000002 /* CoreMedia.framework */,
 				EFA4D6712D59146B00005139 /* libnetsess.xcframework */,
 				EF0D7D1C2D26F0F9000E516A /* libtorrentrepo.xcframework */,
 				EF0D7D182D26F0E7000E516A /* libanixart.xcframework */,

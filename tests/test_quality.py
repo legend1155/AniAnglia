@@ -42,4 +42,16 @@ assert 'registerReleaseMetadata:_release' in release
 assert 'setEpisodeNames:names' in episodes
 assert '_episodeNames = [names copy]' in player and 'self.episodeNames = [names copy]' not in player
 assert 'error:nil' not in player
+# A header import alone does not link CoreMedia in this Objective-C++ target.
+import re
+project = (root/'AniAnglia.xcodeproj/project.pbxproj').read_text()
+file_match = re.search(r'([A-F0-9]{24}) /\* CoreMedia.framework \*/ = \{isa = PBXFileReference;([^}]+)\};', project)
+assert file_match and 'System/Library/Frameworks/CoreMedia.framework' in file_match[2] and 'sourceTree = SDKROOT' in file_match[2]
+file_id = file_match[1]
+build_match = re.search(r'([A-F0-9]{24}) /\* CoreMedia.framework in Frameworks \*/ = \{isa = PBXBuildFile; fileRef = ' + file_id, project)
+assert build_match, 'CoreMedia needs a PBXBuildFile, not just a file reference'
+phases = re.findall(r'([A-F0-9]{24}) /\* Frameworks \*/ = \{\s*isa = PBXFrameworksBuildPhase;([^}]+)\};', project)
+assert any(build_match[1] in body for _, body in phases), 'CoreMedia must be in the target Frameworks build phase'
+assert '#import <CoreMedia/CoreMedia.h>' in player
+print('PASS: CoreMedia SDK reference and target link-phase regression checks.')
 print('PASS: source regression checks; iOS compilation and device UI still require Xcode/iPhone.')
