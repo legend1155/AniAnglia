@@ -16,6 +16,82 @@
 #import "SettingsAppearanceViewController.h"
 #import "SettingsSecurityViewController.h"
 
+// Playback preferences and image cache controls share the existing settings target.
+@interface PlaybackSettingsViewController : UITableViewController
+@property(nonatomic) BOOL cacheMode;
+@property(nonatomic, strong) AppSettingsDataController* settings;
+@end
+@implementation PlaybackSettingsViewController
+-(void)viewDidLoad {
+    [super viewDidLoad];
+    self.settings = [[AppDataController sharedInstance] getSettingsController];
+    self.title = self.cacheMode ? @"Кеш изображений" : @"Воспроизведение";
+}
+-(NSInteger)tableView:(UITableView*)tableView numberOfRowsInSection:(NSInteger)section { return self.cacheMode ? 2 : 10; }
+-(UITableViewCell*)tableView:(UITableView*)tableView cellForRowAtIndexPath:(NSIndexPath*)path {
+    UITableViewCell* cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+    if (self.cacheMode) {
+        cell.textLabel.text = path.row == 0 ? @"Лимит кеша" : @"Очистить кеш изображений";
+        if (!path.row) cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld МБ", (long)[self.settings getMaxCacheSizeBytes]/1024/1024];
+        return cell;
+    }
+    NSArray* titles = @[@"Плеер", @"Качество", @"Озвучка по умолчанию", @"Источник по умолчанию", @"Запоминать выбор", @"Следующая серия автоматически", @"Автопропуск опенинга", @"Начало опенинга (сек.)", @"Длительность опенинга (сек.)", @"Сбросить прогресс просмотра"];
+    cell.textLabel.text = titles[path.row];
+    NSArray* keys = @[@"default_player", @"preffered_quality", @"preferred_type_name", @"preferred_source_name", @"remember_source", @"auto_next_video", @"auto_skip_opening", @"opening_start", @"default_skip_time"];
+    if (path.row >= 4 && path.row <= 6) {
+        UISwitch* toggle = [UISwitch new]; toggle.tag = path.row;
+        toggle.on = [[self.settings getSettingsObjectAtKey:keys[path.row]] boolValue];
+        [toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = toggle;
+    } else if (path.row < keys.count) {
+        id value = [self.settings getSettingsObjectAtKey:keys[path.row]];
+        cell.detailTextLabel.text = path.row == 0 ? ([value integerValue] == 2 ? @"Веб" : @"iOS") : [value description];
+    }
+    return cell;
+}
+-(void)toggleChanged:(UISwitch*)sender {
+    NSArray* keys = @[@"remember_source", @"auto_next_video", @"auto_skip_opening"];
+    [self.settings setSettingsObject:@(sender.on) atKey:keys[sender.tag - 4]];
+}
+-(void)tableView:(UITableView*)tableView didSelectRowAtIndexPath:(NSIndexPath*)path {
+    [tableView deselectRowAtIndexPath:path animated:YES];
+    if (self.cacheMode && path.row == 1) {
+        [[NSURLCache sharedURLCache] removeAllCachedResponses];
+        [tableView reloadData]; return;
+    }
+    if (!self.cacheMode && path.row >= 4 && path.row <= 6) return;
+    if (!self.cacheMode && path.row == 9) {
+        UIAlertController* confirm = [UIAlertController alertControllerWithTitle:@"Удалить сохранённый прогресс?" message:nil preferredStyle:UIAlertControllerStyleAlert];
+        [confirm addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+        [confirm addAction:[UIAlertAction actionWithTitle:@"Удалить" style:UIAlertActionStyleDestructive handler:^(UIAlertAction* action) { [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"playback_progress"]; }]];
+        [self presentViewController:confirm animated:YES completion:nil]; return;
+    }
+    NSString* key = self.cacheMode ? @"max_cache_size" : (@[@"default_player", @"preffered_quality", @"preferred_type_name", @"preferred_source_name", @"", @"", @"", @"opening_start", @"default_skip_time"])[path.row];
+    NSArray* values = self.cacheMode ? @[@0, @10, @50, @100, @250] : (path.row == 0 ? @[@1, @2] : (path.row == 1 ? @[@"360", @"480", @"720", @"1080"] : nil));
+    UIAlertController* alert = [UIAlertController alertControllerWithTitle:[tableView cellForRowAtIndexPath:path].textLabel.text message:nil preferredStyle:UIAlertControllerStyleAlert];
+    if (values) {
+        for (id value in values) {
+            NSString* title = (!self.cacheMode && path.row == 0) ? ([value integerValue] == 2 ? @"Веб-плеер источника" : @"Встроенный iOS") : [value description];
+            [alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+                [self.settings setSettingsObject:self.cacheMode ? @([value integerValue]*1024*1024) : value atKey:key];
+                [tableView reloadData];
+            }]];
+        }
+    } else {
+        alert.message = path.row == 2 || path.row == 3 ? @"Точное название из списка. Пустое значение — ручной выбор. Также можно выбрать один раз в списке." : @"Опенинг пропускается по заданному интервалу, без распознавания.";
+        [alert addTextFieldWithConfigurationHandler:^(UITextField* field) { field.text = [[self.settings getSettingsObjectAtKey:key] description]; }];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Сохранить" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+            NSString* text = alert.textFields.firstObject.text ?: @"";
+            id value = text;
+            if (path.row >= 7) value = @(MIN(3600, MAX(0, text.integerValue)));
+            [self.settings setSettingsObject:value atKey:key]; [tableView reloadData];
+        }]];
+    }
+    [alert addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+@end
+
 @interface SettingsViewController () <UITableViewDataSource, UITableViewDelegate>
 @property(nonatomic, strong) LibanixartApi* api_proxy;
 @property(nonatomic, strong) AppSettingsDataController* app_settings_controller;
@@ -185,6 +261,7 @@
     NSInteger row = index_path.row;
     [table_view deselectRowAtIndexPath:index_path animated:YES];
     
+    if (section == 3) [self showUnavailableSetting];
     if (section == 0) {
         if (row == 0) {
             [self onProfileSelected];
@@ -194,12 +271,21 @@
         }
     }
     if (section == 1) {
-        if (row == 0) {
-            [self onAppearanceSelected];
+        if (row == 0) [self onAppearanceSelected];
+        if (row == 2 || row == 3) {
+            PlaybackSettingsViewController* settings = [[PlaybackSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+            settings.cacheMode = row == 2;
+            [self.navigationController pushViewController:settings animated:YES];
         }
+        if (row == 1) [self showUnavailableSetting];
     }
 }
 
+-(void)showUnavailableSetting {
+    UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"Пока недоступно" message:@"Этот раздел ещё не реализован." preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"ОК" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
 -(void)onLogoutItemSelected {
     
 }

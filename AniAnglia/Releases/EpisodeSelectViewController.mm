@@ -11,6 +11,8 @@
 #import "StringCvt.h"
 #import "PlayerViewController.h"
 #import "LoadableView.h"
+#import "AppDataController.h"
+#include <algorithm>
 
 @interface EpisodeViewCell : UITableViewCell
 @property(nonatomic, retain) UILabel* name_label;
@@ -113,6 +115,7 @@
     
     [self preSetup];
     [self preSetupLayout];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"⇅" style:UIBarButtonItemStylePlain target:self action:@selector(toggleSort)];
     [self loadEpisodes];
 }
 
@@ -178,6 +181,15 @@
     _type_name_label.textColor = [AppColorProvider textColor];
 }
 
+-(void)sortEpisodes {
+    BOOL descending = [[NSUserDefaults standardUserDefaults] boolForKey:@"episodes_descending"];
+    std::sort(_episodes.begin(), _episodes.end(), [descending](const auto& a, const auto& b) { return descending ? a->position > b->position : a->position < b->position; });
+}
+-(void)toggleSort {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setBool:![defaults boolForKey:@"episodes_descending"] forKey:@"episodes_descending"];
+    [self sortEpisodes]; [_table_view reloadData];
+}
 -(void)loadEpisodes {
     [_loadable_view startLoading];
     [_api_proxy asyncCall:^BOOL(anixart::Api* api) {
@@ -186,7 +198,9 @@
     } completion:^(BOOL errored) {
         [self->_loadable_view endLoadingWithErrored:errored];
         if (!errored) {
+            [self sortEpisodes];
             [self setup];
+            [self setupLayout];
         }
     }];
 }
@@ -235,26 +249,12 @@
 
 -(void)tableView:(UITableView *)table_view didSelectRowAtIndexPath:(NSIndexPath *)index_path {
     NSInteger index = [index_path item];
-    EpisodeViewCell* cell = [table_view cellForRowAtIndexPath:index_path];
     [table_view deselectRowAtIndexPath:index_path animated:YES];
-    
     anixart::Episode::Ptr episode = _episodes[index];
-    [[PlayerController sharedInstance] playWithReleaseID:_release_id sourceID:_source_id position:episode->position autoShow:YES completion:^(BOOL errored){
-        if (errored) {
-            return;
-        }
-        /* pre set just for instant UI update. Then update to real state */
-        episode->is_watched = YES;
-        [cell setWatchedStatus:YES];
-        
-        [self->_api_proxy performAsyncBlock:^BOOL(anixart::Api* api) {
-            api->episodes().add_watched_episode(self->_release_id, self->_source_id, episode->position);
-            return YES;
-        } withUICompletion:^{
-            episode->is_watched = YES;
-            [cell setWatchedStatus:YES];
-        }];
-    }];
+    NSMutableArray<NSNumber*>* positions = [NSMutableArray new];
+    for (const auto& item : _episodes) [positions addObject:@(item->position)];
+    [[PlayerController sharedInstance] setEpisodePositions:positions];
+    [[PlayerController sharedInstance] playWithReleaseID:_release_id sourceID:_source_id position:episode->position autoShow:YES completion:^(BOOL errored) {}];
 }
 
 -(void)cellDownloadButtonActionPressed:(NSIndexPath*)index_path {

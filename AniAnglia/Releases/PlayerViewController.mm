@@ -1,195 +1,262 @@
-//
-//  PlayerViewController.m
-//  iOSAnixart
-//
-//  Created by Toilettrauma on 07.10.2024.
-//
-
-#import <AVFoundation/AVFoundation.h>
-#import <AVKit/AVKit.h>
-#import <MediaPlayer/MediaPlayer.h>
+// Native playback lifecycle, resume, queue and source web fallback.
 #import "PlayerViewController.h"
-#import "AppColor.h"
-#import "LibanixartApi.h"
+#import <AVFoundation/AVFoundation.h>
+#import <AVFAudio/AVFAudio.h>
+#import "AppDataController.h"
 #import "StringCvt.h"
+#import <SafariServices/SafariServices.h>
+#include <cctype>
+#include <cmath>
+#include <algorithm>
+
+// Labels may be "720p", "auto", etc. Never throw from std::stol.
+std::string choose_quality(const std::unordered_map<std::string, std::string>& qualities, const std::string_view preferred) {
+    auto exact = qualities.find(std::string(preferred));
+    if (exact != qualities.end() && !exact->second.empty()) return exact->second;
+    long best = -1;
+    std::string result;
+    for (const auto& [label, url] : qualities) {
+        if (url.empty()) continue;
+        long value = 0;
+        for (unsigned char c : label) {
+            if (!std::isdigit(c)) break;
+            value = std::min(100000L, value * 10 + c - '0');
+        }
+        if (value > best || (value == best && url < result)) { best = value; result = url; }
+    }
+    return result;
+}
 
 @interface PlayerViewController : AVPlayerViewController
-
+@property(nonatomic, copy) void (^onClose)(void);
+@end
+@implementation PlayerViewController
+-(void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    if (self.isBeingDismissed && !self.pictureInPictureActive && self.onClose) self.onClose();
+}
 @end
 
 @interface PlayerController ()
-@property(atomic) anixart::ReleaseID release_id;
-@property(atomic) anixart::EpisodeSourceID source_id;
-@property(atomic) long source_position;
-@property(nonatomic, retain) LibanixartApi* api_proxy;
-@property(nonatomic) std::unordered_map<std::string, std::string> streams_arr;
-@property(nonatomic, retain) NSURL* selected_stream_url;
-@property(nonatomic, weak) PlayerViewController* player_view_controller;
-@property(nonatomic, retain) AVPictureInPictureController* pip_controller;
-@property(nonatomic) BOOL just_restored_pip;
-
-@end
-
-static const std::string_view preferred_quality = "720";
-std::string choose_quality(const std::unordered_map<std::string, std::string>& quals, const std::string_view preffered) {
-    auto preferred = quals.find(std::string(preffered.data()));
-    if (preferred != quals.end()) {
-        return preferred->second;
-    }		
-    long long_quality = 0;
-    std::string quality_url;
-    for (auto& [q, u] : quals) {
-        long this_long_quality = std::stol(q);
-        if (long_quality < this_long_quality) {
-            long_quality = this_long_quality;
-            quality_url.assign(u);
-        }
-    }
-    return quality_url;
-}
-
-@implementation PlayerViewController
-
+@property(nonatomic) anixart::ReleaseID release_id;
+@property(nonatomic) anixart::EpisodeSourceID source_id;
+@property(nonatomic) long source_position;
+@property(nonatomic, strong) PlayerViewController* player_view_controller;
+@property(nonatomic, strong) AVPlayer* observedPlayer;
+@property(nonatomic, strong) AVPlayerItem* observedItem;
+@property(nonatomic, strong) id timeObserver;
+@property(nonatomic, strong) NSURL* targetURL;
+@property(nonatomic, strong) NSURL* selected_stream_url;
+@property(nonatomic, copy) NSArray<NSNumber*>* positions;
+@property(nonatomic, copy) NSString* progressKey;
+@property(nonatomic) NSUInteger generation;
+@property(nonatomic) BOOL ready;
+@property(nonatomic) BOOL resumePending;
+@property(nonatomic) BOOL openingHandled;
+@property(nonatomic) BOOL advancing;
 @end
 
 @implementation PlayerController
-
 -(instancetype)init {
-    self = [super init];
-    
-    _release_id = static_cast<anixart::ReleaseID>(-1);
-    _source_id = static_cast<anixart::EpisodeSourceID>(-1);
-    _source_position = -1;
-    _api_proxy = [LibanixartApi sharedInstance];
-    [self setupLayout];
-    
+    if ((self = [super init])) {
+        _positions = @[];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(saveProgress) name:UIApplicationDidEnterBackgroundNotification object:nil];
+    }
     return self;
 }
-
--(void)loadStreamsAndAutoPlay:(BOOL)auto_play completion:(void(^)(BOOL errored))completion_handler {
-    __block BOOL stream_founded = NO;
-    [_api_proxy performAsyncBlock:^BOOL(anixart::Api* api){
-        auto ep_target = self->_api_proxy.api->episodes().get_episode_target(self->_release_id, self->_source_id, static_cast<int32_t>(self->_source_position));
-        self->_streams_arr = self->_api_proxy.parsers->extract_info(ep_target->url);
-        auto selected_stream = choose_quality(self->_streams_arr, preferred_quality);
-        self->_selected_stream_url = [NSURL URLWithString:TO_NSSTRING(selected_stream)];
-        stream_founded = !self->_streams_arr.empty();
-        return YES;
-    } withUICompletion:^{
-        completion_handler(!stream_founded);
-        if (!stream_founded) {
-            UIAlertController* alert = [UIAlertController alertControllerWithTitle:NSLocalizedString(@"app.player.stream_not_found_error.title", "") message:NSLocalizedString(@"app.player.stream_not_found_error.message", "") preferredStyle:UIAlertControllerStyleAlert];
-            UIAlertAction* default_action = [UIAlertAction actionWithTitle:NSLocalizedString(@"app.player.stream_not_found_error.default_action.text", "") style:UIAlertActionStyleDefault
-               handler:^(UIAlertAction * action) {
-                [self->_player_view_controller dismissViewControllerAnimated:YES completion:nil];
-            }];
-            [alert addAction:default_action];
-            [self showViewController:alert];
-            return;
+-(AppSettingsDataController*)settings { return [[AppDataController sharedInstance] getSettingsController]; }
+-(void)setEpisodePositions:(NSArray<NSNumber*>*)positions { self.positions = [positions sortedArrayUsingSelector:@selector(compare:)]; }
+-(void)saveProgress {
+    if (!self.ready || self.resumePending || !self.progressKey || !self.observedPlayer) return;
+    double seconds = CMTimeGetSeconds(self.observedPlayer.currentTime);
+    double duration = CMTimeGetSeconds(self.observedItem.duration);
+    if (!std::isfinite(seconds) || seconds < 0) return;
+    NSMutableDictionary* progress = [[[NSUserDefaults standardUserDefaults] dictionaryForKey:@"playback_progress"] mutableCopy] ?: [NSMutableDictionary new];
+    if (std::isfinite(duration) && duration > 0 && seconds >= duration - 3) [progress removeObjectForKey:self.progressKey];
+    else progress[self.progressKey] = @(seconds);
+    [[NSUserDefaults standardUserDefaults] setObject:progress forKey:@"playback_progress"];
+}
+-(void)stopObserving {
+    [self saveProgress];
+    if (self.timeObserver) [self.observedPlayer removeTimeObserver:self.timeObserver];
+    self.timeObserver = nil;
+    if (self.observedItem) {
+        [self.observedItem removeObserver:self forKeyPath:@"status" context:NULL];
+        [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemDidPlayToEndTimeNotification object:self.observedItem];
+        [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemFailedToPlayToEndTimeNotification object:self.observedItem];
+    }
+    [self.observedPlayer pause];
+    self.observedItem = nil; self.observedPlayer = nil; self.ready = NO; self.resumePending = NO;
+}
+-(void)showViewController:(UIViewController*)controller {
+    UIViewController* top = nil;
+    for (UIScene* scene in UIApplication.sharedApplication.connectedScenes) {
+        if (scene.activationState != UISceneActivationStateForegroundActive || ![scene isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow* window in ((UIWindowScene*)scene).windows) if (window.isKeyWindow) top = window.rootViewController;
+    }
+    while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) top = top.presentedViewController;
+    if (top != controller && !controller.presentingViewController) [top presentViewController:controller animated:YES completion:nil];
+}
+-(void)prepareController {
+    if (self.player_view_controller.presentingViewController) return;
+    self.player_view_controller = [PlayerViewController new];
+    self.player_view_controller.delegate = self;
+    self.player_view_controller.modalPresentationStyle = UIModalPresentationFullScreen;
+    self.player_view_controller.videoGravity = AVLayerVideoGravityResizeAspect;
+    self.player_view_controller.showsPlaybackControls = YES;
+    self.player_view_controller.view.backgroundColor = UIColor.blackColor;
+    __weak PlayerController* weakSelf = self;
+    __weak PlayerViewController* weakController = self.player_view_controller;
+    self.player_view_controller.onClose = ^{
+        PlayerController* owner = weakSelf;
+        if (!owner || owner.player_view_controller != weakController) return;
+        owner.generation += 1;
+        [owner stopObserving];
+        owner.player_view_controller.player = nil;
+        owner.player_view_controller = nil;
+    };
+}
+-(void)playWithReleaseID:(anixart::ReleaseID)release_id sourceID:(anixart::EpisodeSourceID)source_id position:(long)position autoShow:(BOOL)auto_show completion:(void(^)(BOOL))completion {
+    [self stopObserving];
+    self.release_id = release_id; self.source_id = source_id; self.source_position = position;
+    self.targetURL = nil;
+    self.progressKey = [NSString stringWithFormat:@"%lld:%lld:%lld:%ld", (long long)static_cast<int64_t>([[AppDataController sharedInstance] getMyProfileID]), (long long)static_cast<int64_t>(release_id), (long long)static_cast<int64_t>(source_id), position];
+    self.advancing = NO; self.openingHandled = NO;
+    NSUInteger generation = ++self.generation;
+    [self prepareController];
+    if (auto_show) [self showViewController:self.player_view_controller];
+    NSString* quality = [[self settings] getPrefferedQuality] ?: @"720";
+    BOOL web = [[self settings] getDefaultPlayer] == app_settings::Playback::DefaultPlayer::Web;
+    __block NSURL* target = nil;
+    __block NSURL* stream = nil;
+    [[LibanixartApi sharedInstance] asyncCall:^BOOL(anixart::Api* api) {
+        auto episode = api->episodes().get_episode_target(release_id, source_id, (int32_t)position);
+        target = [NSURL URLWithString:TO_NSSTRING(episode->url)];
+        if (!target || ![@[@"https", @"http"] containsObject:target.scheme.lowercaseString]) return YES;
+        if (web) return NO;
+        NSString* extension = target.pathExtension.lowercaseString;
+        if ([@[@"m3u8", @"mp4", @"m4v"] containsObject:extension]) stream = target;
+        else {
+            auto streams = [LibanixartApi sharedInstance].parsers->extract_info(episode->url);
+            std::string preferred = TO_STDSTRING(quality);
+            stream = [NSURL URLWithString:TO_NSSTRING(choose_quality(streams, preferred))];
         }
-        if (auto_play) {
-            [self runPlayer];
+        return !stream || ![@[@"https", @"http"] containsObject:stream.scheme.lowercaseString];
+    } completion:^(BOOL errored) {
+        if (generation != self.generation) { if (completion) completion(YES); return; }
+        self.targetURL = target;
+        if (web && !errored) {
+            [self openWebPlayer]; if (completion) completion(NO); return;
         }
+        if (errored) { if (completion) completion(YES); [self showPlaybackError]; return; }
+        self.selected_stream_url = stream;
+        [self runPlayer];
+        if (completion) completion(NO);
     }];
 }
-
--(void)playWithReleaseID:(anixart::ReleaseID)release_id sourceID:(anixart::EpisodeSourceID)source_id position:(long)position autoShow:(BOOL)auto_show completion:(void(^)(BOOL errored))completion_handler {
-    _release_id = release_id;
-    _source_id = source_id;
-    _source_position = position;
-    
-//    _pip_controller = [AVPictureInPictureController alloc] init;
-    
-    if (_player_view_controller) {
-        _player_view_controller.player = nil;
-    }
-    
-    PlayerViewController* player_view_controller = [PlayerViewController new];
-    [player_view_controller setDelegate:self];
-    player_view_controller.modalPresentationStyle = UIModalPresentationFullScreen;
-//    [_pip_controller stopPictureInPicture];
-    
-    _player_view_controller = player_view_controller;
-    
-    [_pip_controller setDelegate:self];
-    [self loadStreamsAndAutoPlay:YES completion:completion_handler];
-    if (auto_show) {
-        [self showViewController:player_view_controller];
-    }
-}
-
--(void)showAndRunPlayer {
-    [self showViewController:_player_view_controller];
-    [self runPlayer];
-}
-
--(void)showViewController:(UIViewController*)view_controller {
-    UIViewController* top_view_controller = [[[[UIApplication sharedApplication] delegate] window] rootViewController]; // should be MainTabBarController
-    [top_view_controller presentViewController:view_controller animated:NO completion:nil];
-}
-
 -(void)playWithURL:(NSURL*)url {
-    _selected_stream_url = url;
-    [self runPlayer];
+    ++self.generation; [self stopObserving]; self.progressKey = nil; self.positions = @[];
+    self.targetURL = url; self.selected_stream_url = url;
+    [self prepareController]; [self showViewController:self.player_view_controller]; [self runPlayer];
 }
-
 -(void)runPlayer {
-    _player_view_controller.player = [AVPlayer playerWithURL:_selected_stream_url];
-    AVURLAsset* asset = (AVURLAsset*)_player_view_controller.player.currentItem.asset;
-    [_player_view_controller.player play];
-    
-    _player_view_controller.view.backgroundColor = [UIColor blackColor];
-    
-    AVMutableMetadataItem* title = [AVMutableMetadataItem new];
-    title.identifier = AVMetadataCommonIdentifierTitle;
-    title.value = @"YO";
-    title.extendedLanguageTag = @"und";
-    AVMutableMetadataItem* desc = [AVMutableMetadataItem new];
-    desc.identifier = AVMetadataCommonIdentifierArtist;
-    desc.value = @"HO";
-    desc.extendedLanguageTag = @"und";
-    _player_view_controller.player.currentItem.externalMetadata = @[
-        title,
-        desc
-    ];
+    [self stopObserving];
+    NSError* error = nil;
+    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:&error];
+    [[AVAudioSession sharedInstance] setActive:YES error:&error];
+    AVPlayerItem* item = [AVPlayerItem playerItemWithURL:self.selected_stream_url];
+    self.observedPlayer = [AVPlayer playerWithPlayerItem:item];
+    self.observedItem = item;
+    self.player_view_controller.player = self.observedPlayer;
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(episodeEnded:) name:AVPlayerItemDidPlayToEndTimeNotification object:item];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(playbackFailed:) name:AVPlayerItemFailedToPlayToEndTimeNotification object:item];
+    [item addObserver:self forKeyPath:@"status" options:NSKeyValueObservingOptionInitial | NSKeyValueObservingOptionNew context:NULL];
 }
-
--(void)setupLayout {
-//    _player_view_controller.view.backgroundColor = [AppColorProvider backgroundColor];
-}
-
--(AVPlayerViewController*)getPlayer {
-    return _player_view_controller;
-}
-
-+(instancetype)sharedInstance {
-    static PlayerController* sharedInstance = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        sharedInstance = [PlayerController new];
+-(void)observeValueForKeyPath:(NSString*)keyPath ofObject:(id)object change:(NSDictionary*)change context:(void*)context {
+    if (object != self.observedItem || ![keyPath isEqualToString:@"status"]) { [super observeValueForKeyPath:keyPath ofObject:object change:change context:context]; return; }
+    // AVFoundation may deliver KVO off-main. Queue all UI and lifecycle work.
+    NSUInteger generation = self.generation;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (generation != self.generation || object != self.observedItem) return;
+        if (self.observedItem.status == AVPlayerItemStatusFailed) { [self showPlaybackError]; return; }
+        if (self.observedItem.status != AVPlayerItemStatusReadyToPlay || self.ready) return;
+        self.ready = YES; self.resumePending = YES;
+        NSDictionary* progress = [[NSUserDefaults standardUserDefaults] dictionaryForKey:@"playback_progress"];
+        double resume = self.progressKey ? [progress[self.progressKey] doubleValue] : 0;
+        double duration = CMTimeGetSeconds(self.observedItem.duration);
+        if (!std::isfinite(resume) || resume < 0 || (std::isfinite(duration) && resume >= duration - 3)) resume = 0;
+        __weak PlayerController* weakSelf = self;
+        [self.observedPlayer seekToTime:CMTimeMakeWithSeconds(resume, 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero completionHandler:^(BOOL finished) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                PlayerController* owner = weakSelf;
+                if (!owner || generation != owner.generation || !finished) return;
+                owner.resumePending = NO;
+                [owner.observedPlayer play];
+                owner.timeObserver = [owner.observedPlayer addPeriodicTimeObserverForInterval:CMTimeMake(1, 1) queue:dispatch_get_main_queue() usingBlock:^(CMTime time) {
+                    PlayerController* current = weakSelf;
+                    if (!current || generation != current.generation) return;
+                    [current handleOpeningAt:CMTimeGetSeconds(time)];
+                    [current saveProgress];
+                }];
+            });
+        }];
     });
-    return sharedInstance;
 }
-
--(void)playerViewControllerWillStartPictureInPicture:(AVPlayerViewController*)player_view_controller{
-
-}
--(void)playerViewControllerDidStopPictureInPicture:(AVPlayerViewController*)player_view_controller {
-    if (!_just_restored_pip) {
-        _player_view_controller.player = nil;
+-(void)handleOpeningAt:(double)seconds {
+    if (self.openingHandled || !std::isfinite(seconds)) return;
+    AppSettingsDataController* settings = [self settings];
+    double begin = MAX(0, [[settings getSettingsObjectAtKey:@"opening_start"] doubleValue]);
+    double length = std::chrono::duration_cast<std::chrono::seconds>([settings getDefaultSkipTime]).count();
+    if (seconds >= begin + length) { self.openingHandled = YES; return; }
+    if ([[settings getSettingsObjectAtKey:@"auto_skip_opening"] boolValue] && seconds >= begin && length > 0) {
+        self.openingHandled = YES;
+        double duration = CMTimeGetSeconds(self.observedItem.duration);
+        if (std::isfinite(duration) && begin + length < duration)
+            [self.observedPlayer seekToTime:CMTimeMakeWithSeconds(begin + length, 600)];
     }
-    _just_restored_pip = false;
 }
-
--(void)playerViewController:(AVPlayerViewController *)player_view_controller restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL restored))completion_handler {
-    /* cancelled by PlayerController */
-    _just_restored_pip = true;
-    if (!player_view_controller.player) {
-        completion_handler(YES);
-        return;
+-(void)episodeEnded:(NSNotification*)notification {
+    if (notification.object != self.observedItem || self.advancing) return;
+    [self saveProgress];
+    if (!self.progressKey) return;
+    auto release = self.release_id; auto source = self.source_id; long position = self.source_position;
+    [[LibanixartApi sharedInstance] asyncCall:^BOOL(anixart::Api* api) {
+        api->episodes().add_watched_episode(release, source, (int32_t)position); return NO;
+    } completion:^(BOOL errored) {}];
+    if (![[self settings] getAutoNextVideo]) return;
+    for (NSNumber* next in self.positions) if (next.longValue > position) {
+        self.advancing = YES;
+        [self playWithReleaseID:release sourceID:source position:next.longValue autoShow:NO completion:nil];
+        break;
     }
-    [self showViewController:player_view_controller];
-//    completion_handler(YES);
 }
-
+-(void)playbackFailed:(NSNotification*)notification { [self showPlaybackError]; }
+-(void)showPlaybackError {
+    [self.observedPlayer pause];
+    if (self.player_view_controller.presentedViewController) return;
+    UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"Не удалось воспроизвести видео" message:@"Источник не вернул совместимый поток. Можно попробовать веб-плеер источника или другую озвучку." preferredStyle:UIAlertControllerStyleAlert];
+    if (self.targetURL) [alert addAction:[UIAlertAction actionWithTitle:@"Открыть веб-плеер" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) { [self openWebPlayer]; }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Закрыть" style:UIAlertActionStyleCancel handler:^(UIAlertAction* action) { [self.player_view_controller dismissViewControllerAnimated:YES completion:nil]; }]];
+    [self.player_view_controller presentViewController:alert animated:YES completion:nil];
+}
+-(void)openWebPlayer {
+    if (!self.targetURL) return;
+    NSURL* url = self.targetURL;
+    ++self.generation; [self stopObserving];
+    SFSafariViewController* web = [[SFSafariViewController alloc] initWithURL:url];
+    UIViewController* native = self.player_view_controller;
+    self.player_view_controller = nil;
+    if (native.presentingViewController) [native dismissViewControllerAnimated:YES completion:^{ [self showViewController:web]; }];
+    else [self showViewController:web];
+}
+-(AVPlayerViewController*)getPlayer { return self.player_view_controller; }
++(instancetype)sharedInstance {
+    static PlayerController* shared; static dispatch_once_t once;
+    dispatch_once(&once, ^{ shared = [PlayerController new]; }); return shared;
+}
+-(void)playerViewController:(AVPlayerViewController*)controller restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL))completion {
+    if (controller.presentingViewController) { completion(YES); return; }
+    [self showViewController:controller];
+    completion(controller.presentingViewController != nil);
+}
 @end

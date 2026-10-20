@@ -18,6 +18,7 @@
 
 @interface LoadableImageView ()
 @property(nonatomic, retain) NSURLSessionTask* url_load_task;
+@property(nonatomic) NSUInteger imageGeneration;
 @property(nonatomic, retain) LoadableView* loadable_view;
 @end
 
@@ -136,19 +137,21 @@
 
 -(void)tryLoadImageWithURL:(NSURL*)url {
     self.image = nil;
-    if (_url_load_task) {
-        [_url_load_task cancel];
-    }
+    [_url_load_task cancel];
+    NSUInteger generation = ++self.imageGeneration;
     [_loadable_view startLoading];
-    _url_load_task = [[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error != nil || data == nil) {
-            // error
-            return;
-        }
+    if (!url) { [_loadable_view endLoadingWithErrored:YES]; return; }
+    // Protocol-aware HTTP caching: honour expiry and validators; never cache video here.
+    NSURLRequest* request = [NSURLRequest requestWithURL:url cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:30];
+    __weak LoadableImageView* weakSelf = self;
+    _url_load_task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+        UIImage* image = !error && data ? [UIImage imageWithData:data] : nil;
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIImage* image = [UIImage imageWithData:data];
-            self.image = image;
-            [self->_loadable_view endLoading];
+            LoadableImageView* owner = weakSelf;
+            if (!owner || owner.imageGeneration != generation) return;
+            owner.image = image;
+            [owner.loadable_view endLoadingWithErrored:image == nil];
+            owner.url_load_task = nil;
         });
     }];
     [_url_load_task resume];

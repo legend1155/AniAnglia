@@ -61,7 +61,7 @@
         catch (network::UrlSessionError& e) {
             NSLog(@"Uncatched libanixart::UrlSession exception: %s", e.what());
         }
-        catch (std::runtime_error& e) {
+        catch (std::exception& e) {
             NSLog(@"Uncatched libanixart runtime error: %s", e.what());
         }
     });
@@ -85,7 +85,7 @@
             NSLog(@"Uncatched libanixart::UrlSession exception: %s", e.what());
             errored |= YES;
         }
-        catch (std::runtime_error& e) {
+        catch (std::exception& e) {
             NSLog(@"Uncatched libanixart runtime error: %s", e.what());
             errored |= YES;
         }

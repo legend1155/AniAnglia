@@ -31,7 +31,8 @@ struct Appearance {
 struct Playback {
     enum class DefaultPlayer {
         None = 0,
-        Internal = 1
+        Internal = 1,
+        Web = 2
     };
     
     // kindof DefaultPlayer enum
@@ -84,7 +85,9 @@ struct General {
 -(void)setDefaultSkipTime:(std::chrono::system_clock::duration)default_skip_time;
 -(BOOL)getAutoNextVideo;
 -(void)setAutoNextVideo:(BOOL)auto_next_video;
--(BOOL)setRememberSource;
+-(BOOL)getRememberSource;
+-(BOOL)setRememberSource; // compatibility alias
+-(id)getSettingsObjectAtKey:(NSString*)key;
 -(void)setRememberSource:(BOOL)remember_source;
 
 // -- notifications

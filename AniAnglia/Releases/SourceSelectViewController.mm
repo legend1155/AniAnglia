@@ -11,6 +11,8 @@
 #import "StringCvt.h"
 #import "EpisodeSelectViewController.h"
 #import "LoadableView.h"
+#import "AppDataController.h"
+#include <algorithm>
 
 @interface SourceViewCell : UITableViewCell
 @property(nonatomic, retain) UILabel* name_label;
@@ -28,6 +30,7 @@
     std::vector<anixart::EpisodeSource::Ptr> _sources;
 }
 @property(nonatomic, retain) NSString* type_name;
+@property(nonatomic) BOOL triedPreference;
 @property(nonatomic, retain) LibanixartApi* api_proxy;
 @property(nonatomic, retain) UIView* header_view;
 @property(nonatomic, retain) UILabel* type_name_label;
@@ -90,6 +93,7 @@
     
     [self preSetup];
     [self preSetupLayout];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"А–Я" style:UIBarButtonItemStylePlain target:self action:@selector(toggleSort)];
     [self loadSources];
 }
 
@@ -155,6 +159,18 @@
     _type_name_label.textColor = [AppColorProvider textColor];
 }
 
+-(void)sortItems {
+    BOOL descending = [[NSUserDefaults standardUserDefaults] boolForKey:@"sources_descending"];
+    std::sort(_sources.begin(), _sources.end(), [descending](const auto& a, const auto& b) {
+        NSComparisonResult result = [TO_NSSTRING(a->name) localizedCaseInsensitiveCompare:TO_NSSTRING(b->name)];
+        return descending ? result == NSOrderedDescending : result == NSOrderedAscending;
+    });
+}
+-(void)toggleSort {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setBool:![defaults boolForKey:@"sources_descending"] forKey:@"sources_descending"];
+    [self sortItems]; [_table_view reloadData];
+}
 -(void)loadSources {
     [_loadable_view startLoading];
     
@@ -164,7 +180,19 @@
     } completion:^(BOOL errored) {
         [self->_loadable_view endLoadingWithErrored:errored];
         if (!errored) {
+            [self sortItems];
             [self setup];
+            [self setupLayout];
+            if (!self.triedPreference) {
+                self.triedPreference = YES;
+                NSString* preferred = [[[AppDataController sharedInstance] getSettingsController] getSettingsObjectAtKey:@"preferred_source_name"];
+                for (const auto& item : self->_sources) {
+                    if (preferred.length && [TO_NSSTRING(item->name) caseInsensitiveCompare:preferred] == NSOrderedSame) {
+                        [self.navigationController pushViewController:[[EpisodeSelectViewController alloc] initWithReleaseID:_release_id typeID:_type_id typeName:_type_name sourceID:item->id sourceName:TO_NSSTRING(item->name)] animated:NO];
+                        break;
+                    }
+                }
+            }
         }
     }];
 }
@@ -190,6 +218,9 @@
     [table_view deselectRowAtIndexPath:index_path animated:YES];
     NSInteger index = [index_path item];
     anixart::EpisodeSource::Ptr& source = _sources[index];
+    AppSettingsDataController* settings = [[AppDataController sharedInstance] getSettingsController];
+    if ([settings getRememberSource]) [settings setSettingsObject:TO_NSSTRING(source->name) atKey:@"preferred_source_name"];
+
     
     [self.navigationController pushViewController:[[EpisodeSelectViewController alloc] initWithReleaseID:_release_id typeID:_type_id typeName:_type_name sourceID:source->id sourceName:TO_NSSTRING(source->name)] animated:NO];
 }

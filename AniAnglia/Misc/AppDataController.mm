@@ -30,7 +30,11 @@
         app_settings::Playback::preffered_quality: @"720",
         app_settings::Playback::default_skip_time: @90,
         app_settings::Playback::auto_next_video: @(NO),
-        app_settings::Playback::remember_source: @(NO),
+        app_settings::Playback::remember_source: @(YES),
+        @"auto_skip_opening": @NO,
+        @"opening_start": @0,
+        @"preferred_type_name": @"",
+        @"preferred_source_name": @"",
         // -- data control
         app_settings::DataControl::max_cache_size: @(10 * 1024 * 1024),
         // -- general
@@ -42,7 +46,10 @@
     self = [super init];
     
     _user_defaults = user_defaults;
-    _settings_dict = [[_user_defaults objectForKey:@"settings"] mutableCopy];
+    // Merge defaults when migrating older installations, not just fresh installs.
+    _settings_dict = [[AppSettingsDataController getDefaults] mutableCopy];
+    NSDictionary* saved = [_user_defaults dictionaryForKey:@"settings"];
+    if (saved) [_settings_dict addEntriesFromDictionary:saved];
     
     return self;
 }
@@ -59,7 +66,14 @@
     [[NSNotificationCenter defaultCenter] postNotification:notification];
 }
 -(void)setSettingsObject:(id)object atKey:(NSString*)key {
-    [_settings_dict setValue:object forKey:key];
+    if (!object || !key) return;
+    [_settings_dict setObject:object forKey:key];
+    if ([key isEqualToString:app_settings::DataControl::max_cache_size]) {
+        NSUInteger size = MAX(0, [object integerValue]);
+        [NSURLCache sharedURLCache].diskCapacity = size;
+        [NSURLCache sharedURLCache].memoryCapacity = MIN(size, 16 * 1024 * 1024);
+        if (!size) [[NSURLCache sharedURLCache] removeAllCachedResponses];
+    }
     [self saveSettings];
     [self postNotificationForObject:object atKey:key];
 }
@@ -99,7 +113,7 @@
     [self setSettingsObject:preffered_quality atKey:app_settings::Playback::preffered_quality];
 }
 -(std::chrono::system_clock::duration)getDefaultSkipTime {
-    NSNumber* default_skip_time = [self getSettingsObjectAtKey:app_settings::Playback::preffered_quality];
+    NSNumber* default_skip_time = [self getSettingsObjectAtKey:app_settings::Playback::default_skip_time];
     return std::chrono::seconds([default_skip_time longValue]);
 }
 -(void)setDefaultSkipTime:(std::chrono::system_clock::duration)default_skip_time {
@@ -113,7 +127,8 @@
 -(void)setAutoNextVideo:(BOOL)auto_next_video {
     [self setSettingsObject:@(auto_next_video) atKey:app_settings::Playback::auto_next_video];
 }
--(BOOL)setRememberSource {
+-(BOOL)setRememberSource { return [self getRememberSource]; }
+-(BOOL)getRememberSource {
     NSNumber* remember_source = [self getSettingsObjectAtKey:app_settings::Playback::remember_source];
     return [remember_source boolValue];
 }
@@ -160,6 +175,8 @@
         @"settings": [AppSettingsDataController getDefaults]
     }];
     _settings_controller = [[AppSettingsDataController alloc] initWithUserDefaults:_user_defaults];
+    NSUInteger size = MAX(0, [_settings_controller getMaxCacheSizeBytes]);
+    [NSURLCache setSharedURLCache:[[NSURLCache alloc] initWithMemoryCapacity:MIN(size, 16 * 1024 * 1024) diskCapacity:size diskPath:@"AniAngliaImages"]];
     
     return self;
 }
