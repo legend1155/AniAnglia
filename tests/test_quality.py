@@ -16,5 +16,11 @@ assert '@interface PlayerViewController : UIViewController' in player
 assert 'playerViewControllerWillStartPictureInPicture:' in player
 assert 'failedToStartPictureInPictureWithError:' in player
 assert '[self.view addSubview:control]' in player
-assert 'playback::openingTarget' in player and 'playback::nextPosition' in player
+assert 'playback::confirmedOpeningTarget' in player and 'playback::nextPosition' in player
+assert 'episode_openings_v3' in player
+assert 'openingMediaIdentity' in player and 'record[@"media"]' in player
+assert 'addBoundaryTimeObserverForTimes:' in player
+assert 'removeTimeObserver:self.openingBoundaryObserver' in player
+opening_method = player[player.index('-(double)openingTargetAt:'):player.index('-(void)skipOpening')]
+assert 'opening_start' not in opening_method and 'getDefaultSkipTime' not in opening_method
 print('PASS: source regression checks; iOS compilation and device UI still require Xcode/iPhone.')

@@ -45,6 +45,46 @@ inline double openingTarget(double seconds, double duration, double begin, doubl
     double target = begin + length;
     return seconds >= begin && seconds < target && target < duration ? target : -1;
 }
+// A skip interval is usable only for its confirmed, matching-duration video.
+inline bool validOpeningInterval(double begin, double end, double duration) {
+    return std::isfinite(begin) && std::isfinite(end) && std::isfinite(duration) &&
+        begin >= 0 && end - begin >= 1 && end < duration && duration > 0;
+}
+inline double confirmedOpeningTarget(double seconds, double duration, double begin, double end, double referenceDuration, bool confirmed) {
+    if (!confirmed || !std::isfinite(referenceDuration) || std::abs(referenceDuration - duration) > 1.0 ||
+        !validOpeningInterval(begin, end, duration)) return -1;
+    return openingTarget(seconds, duration, begin, end - begin);
+}
+// Strict seconds / mm:ss / hh:mm:ss parser. Never silently turn invalid input into 0.
+inline double parseTimestamp(std::string_view text) {
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) text.remove_prefix(1);
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) text.remove_suffix(1);
+    if (text.empty()) return -1;
+    double total = 0;
+    int parts = 0;
+    while (!text.empty()) {
+        size_t colon = text.find(':');
+        auto part = text.substr(0, colon);
+        if (part.empty() || ++parts > 3) return -1;
+        double value = 0, fraction = 0.1;
+        bool decimal = false, digit = false, fractionalDigit = false;
+        for (unsigned char c : part) {
+            if (c == '.' || c == ',') { if (decimal || colon != std::string_view::npos || !digit) return -1; decimal = true; continue; }
+            if (c < '0' || c > '9') return -1;
+            digit = true;
+            if (decimal) { value += (c - '0') * fraction; fraction *= 0.1; fractionalDigit = true; }
+            else value = value * 10 + c - '0';
+            if (value > 86400) return -1;
+        }
+        if (!digit || (decimal && !fractionalDigit) || (parts > 1 && value >= 60)) return -1;
+        total = total * 60 + value;
+        if (total > 86400) return -1;
+        if (colon == std::string_view::npos) return total;
+        text.remove_prefix(colon + 1);
+        if (text.empty()) return -1;
+    }
+    return -1;
+}
 inline bool shouldSkipEnding(double seconds, double duration, double length, bool hasNext) {
     return hasNext && std::isfinite(seconds) && std::isfinite(duration) && std::isfinite(length) && length > 0 &&
         duration > length + 30 && seconds >= duration - length && seconds < duration;
