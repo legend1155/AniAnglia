@@ -61,12 +61,15 @@ static const CGFloat RATING_BADGE_HEIGHT = 35;
     
     _title_label = [UILabel new];
     _title_label.numberOfLines = 2;
-    _title_label.font = [UIFont boldSystemFontOfSize:_title_label.font.pointSize];
+    _title_label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+    _title_label.adjustsFontForContentSizeCategory = YES;
     
     _ep_count_label = [UILabel new];
+    _ep_count_label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1]; _ep_count_label.adjustsFontForContentSizeCategory = YES;
     
     _description_label = [UILabel new];
-    _description_label.numberOfLines = -1;
+    _description_label.numberOfLines = 3;
+    _description_label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline]; _description_label.adjustsFontForContentSizeCategory = YES;
     
     _rating_label = [UILabel new];
     _rating_label.layer.cornerRadius = RATING_BADGE_HEIGHT / 2;
@@ -88,7 +91,7 @@ static const CGFloat RATING_BADGE_HEIGHT = 35;
     [NSLayoutConstraint activateConstraints:@[
         [_image_view.centerYAnchor constraintEqualToAnchor:self.contentView.layoutMarginsGuide.centerYAnchor],
         [_image_view.leadingAnchor constraintEqualToAnchor:self.contentView.layoutMarginsGuide.leadingAnchor],
-        [_image_view.heightAnchor constraintEqualToAnchor:self.contentView.layoutMarginsGuide.heightAnchor multiplier:0.93],
+        [_image_view.heightAnchor constraintLessThanOrEqualToAnchor:self.contentView.layoutMarginsGuide.heightAnchor multiplier:0.93],
         [_image_view.widthAnchor constraintEqualToAnchor:_image_view.heightAnchor multiplier:(10. / 16)],
         
         [_title_label.topAnchor constraintEqualToAnchor:_image_view.topAnchor],
@@ -108,7 +111,10 @@ static const CGFloat RATING_BADGE_HEIGHT = 35;
         [_rating_label.heightAnchor constraintEqualToConstant:RATING_BADGE_HEIGHT],
         [_rating_label.widthAnchor constraintEqualToAnchor:_rating_label.heightAnchor],
         [_rating_label.bottomAnchor constraintEqualToAnchor:_image_view.bottomAnchor],
+        [_image_view.heightAnchor constraintLessThanOrEqualToConstant:150],
     ]];
+    NSLayoutConstraint* posterHeight = [_image_view.heightAnchor constraintEqualToConstant:150];
+    posterHeight.priority = UILayoutPriorityDefaultHigh; posterHeight.active = YES;
 }
 
 -(void)setupLayout {

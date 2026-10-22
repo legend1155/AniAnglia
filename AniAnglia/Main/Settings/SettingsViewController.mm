@@ -90,6 +90,7 @@
     [super viewDidLoad];
     self.settings = [[AppDataController sharedInstance] getSettingsController];
     self.title = self.cacheMode ? @"Кеш изображений" : @"Воспроизведение";
+    self.tableView.backgroundColor = UIColor.systemGroupedBackgroundColor;
 }
 -(void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self.tableView reloadData]; }
 -(NSString*)tableView:(UITableView*)tableView titleForFooterInSection:(NSInteger)section {

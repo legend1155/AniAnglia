@@ -29,7 +29,7 @@
         app_settings::Playback::default_player: @(static_cast<int>(app_settings::Playback::DefaultPlayer::Internal)),
         app_settings::Playback::preffered_quality: @"720",
         app_settings::Playback::default_skip_time: @90,
-        app_settings::Playback::auto_next_video: @(NO),
+        app_settings::Playback::auto_next_video: @(YES),
         app_settings::Playback::remember_source: @(YES),
         @"auto_skip_opening": @YES,
         @"aniskip_auto_lookup": @YES,
@@ -63,6 +63,11 @@
         [_user_defaults setBool:YES forKey:@"aniskip_v4_migrated"];
     }
     
+    if (![_user_defaults boolForKey:@"playback_v5_migrated"]) {
+        _settings_dict[app_settings::Playback::auto_next_video] = @YES;
+        [_user_defaults setObject:_settings_dict forKey:@"settings"];
+        [_user_defaults setBool:YES forKey:@"playback_v5_migrated"];
+    }
     return self;
 }
 

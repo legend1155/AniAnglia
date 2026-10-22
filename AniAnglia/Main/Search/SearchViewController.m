@@ -15,6 +15,7 @@
 @property(nonatomic, retain) NSString* initial_search_bar_text;
 
 @property(nonatomic) UIBarButtonItem* orig_right_bar_button;
+@property(nonatomic) BOOL searchEditing;
 
 @end
 
@@ -42,6 +43,8 @@
     _search_bar.delegate = self;
     _search_bar.placeholder = _search_bar_placeholder;
     _search_bar.text = _initial_search_bar_text;
+    _search_bar.searchBarStyle = UISearchBarStyleMinimal;
+    _search_bar.accessibilityLabel = _search_bar_placeholder ?: @"Поиск";
     _search_bar.autoresizingMask = UIViewAutoresizingFlexibleHeight;
     _back_bar_button = [[UIBarButtonItem alloc] initWithPrimaryAction:[UIAction actionWithTitle:@"" image:[UIImage systemImageNamed:@"chevron.left"] identifier:nil handler:^(UIAction* action){
         [self onBackButtonPressed];
@@ -49,6 +52,7 @@
     
     [self addChildViewController:_content_view_controller];
     self.navigationItem.titleView = _search_bar;
+    if (self.right_bar_button) self.navigationItem.rightBarButtonItem = self.right_bar_button;
     [self.view addSubview:_content_view_controller.view];
     
     _content_view_controller.view.translatesAutoresizingMaskIntoConstraints = NO;
@@ -69,19 +73,21 @@
 
 -(void)setBarButtonsHidden:(BOOL)hidden {
     if (hidden) {
-        self.navigationItem.leftBarButtonItem = nil;
-        self.navigationItem.rightBarButtonItem = _orig_right_bar_button;
-        return;
+        self.searchEditing = NO; self.navigationItem.leftBarButtonItem = nil;
+        self.navigationItem.rightBarButtonItem = self.right_bar_button ?: _orig_right_bar_button; return;
     }
-    _orig_right_bar_button = self.navigationItem.rightBarButtonItem;
+    if (!self.searchEditing) _orig_right_bar_button = self.navigationItem.rightBarButtonItem;
+    self.searchEditing = YES;
     [self.navigationItem setLeftBarButtonItem:_back_bar_button animated:YES];
-    [self.navigationItem setRightBarButtonItem:_right_bar_button animated:YES];
+    [self.navigationItem setRightBarButtonItem:self.right_bar_button ?: _orig_right_bar_button animated:YES];
 }
 
 -(void)showInlineSearchViewController:(UIViewController*)view_controller {
     if (!view_controller) {
         return;
     }
+    if (_inline_view_controller == view_controller && view_controller.parentViewController == self) return;
+    [self hideInlineSearchViewController];
     _inline_view_controller = view_controller;
     [self addChildViewController:_inline_view_controller];
     [self.view addSubview:_inline_view_controller.view];
@@ -102,6 +108,7 @@
     [_inline_view_controller willMoveToParentViewController:nil];
     [_inline_view_controller.view removeFromSuperview];
     [_inline_view_controller removeFromParentViewController];
+    _inline_view_controller = nil;
 }
 
 -(void)searchBarTextDidBeginEditing:(UISearchBar*)search_bar {
@@ -110,18 +117,20 @@
     }
     [self setBarButtonsHidden:NO];
     
-    _inline_view_controller = [_data_source inlineViewControllerForSearchViewController:self];
-    [self showInlineSearchViewController:_inline_view_controller];
+    UIViewController* history = [_data_source inlineViewControllerForSearchViewController:self];
+    [self showInlineSearchViewController:history];
 }
 
 -(void)searchBarSearchButtonClicked:(UISearchBar *)search_bar {
     if (search_bar != _search_bar) {
         return;
     }
+    NSString* query = [_search_bar.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!query.length) return;
     [search_bar endEditing:YES];
     [self hideInlineSearchViewController];
     [self setBarButtonsHidden:YES];
-    [_delegate searchViewController:self didSearchWithQuery:_search_bar.text];
+    [_delegate searchViewController:self didSearchWithQuery:query];
 }
 
 -(IBAction)searchBarCancelButtonPressed:(UIBarButtonItem*)sender {

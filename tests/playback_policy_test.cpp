@@ -1,5 +1,6 @@
 #include "PlaybackPolicy.hpp"
 #include "AnimeMapping.hpp"
+#include "../AniAnglia/Main/DiscoveryPolicy.hpp"
 #include <cassert>
 #include <iostream>
 #include <limits>
@@ -131,5 +132,54 @@ int main() {
     check(mappedEpisode({}, {}, 1, 12) == 0);
     check(mappedEpisode({1}, {1}, 2, 12) == 0);
     check(mappedEpisode({1,2,3}, {0,0,0}, 2, 2) == 0); // beyond MAL season size
-    std::cout << "PASS: " << total << " playback policy checks (production C++ header).\n";
+    AnimeIdentity shadow{0, {"восхождениевтени2"}, 2023, 12, 1};
+    check(verifiedAnime(shadow) == 54595);
+    shadow.titles = {"kagenojitsuryokushaninaritakute2ndseason"}; check(verifiedAnime(shadow) == 54595);
+    shadow.titles = {"theeminenceinshadowseason2"}; check(verifiedAnime(shadow) == 54595);
+    shadow.year = 2024; check(verifiedAnime(shadow) == 0);
+    shadow.year = 2023; shadow.episodes = 20; check(verifiedAnime(shadow) == 0);
+    shadow.episodes = 12; shadow.titles = {"восхождениевтени"}; check(verifiedAnime(shadow) == 0);
+    check(confirmedOpeningTarget(133.188, 1422.467, 133.189, 223.189, 1422.467, true) == -1);
+    check(confirmedOpeningTarget(133.189, 1422.467, 133.189, 223.189, 1422.467, true) == 223.189);
+    check(confirmedOpeningTarget(223.189, 1422.467, 133.189, 223.189, 1422.467, true) == -1);
+    check(confirmedOpeningTarget(140, 1424.0, 133.189, 223.189, 1422.467, true) == -1);
+    check(confirmedOpeningTarget(140, 1422.0, 133.189, 223.189, 1422.467, true) == 223.189);
+    for (int mask = 0; mask < 32; ++mask) {
+        bool enabled = mask & 1, matching = mask & 2, ready = mask & 4, advancing = mask & 8, hasNext = mask & 16;
+        check(shouldAutoAdvance(enabled, matching, ready, advancing, hasNext) == (enabled && matching && ready && !advancing && hasNext));
+    }
+    using discovery::Candidate;
+    discovery::Taste taste;
+    discovery::learn(taste, {"action", "action", "fantasy"}, 3);
+    check(taste["action"] == 3 && taste["fantasy"] == 3);
+    discovery::learn(taste, {"action"}, 1000); check(taste["action"] == 100);
+    taste = {{"fantasy", 3}};
+    Candidate favorite{1, {"fantasy"}, 4.2};
+    Candidate popular{2, {"comedy"}, 4.9};
+    check(discovery::score(favorite, taste) > discovery::score(popular, taste));
+    check(discovery::rank({popular, favorite}, taste) == std::vector<long long>({1,2}));
+    check(discovery::rank({popular, favorite}, {}) == std::vector<long long>({2,1}));
+    auto seen = favorite; seen.seen = true; check(discovery::score(seen, taste) == -1);
+    check(discovery::rank({favorite, seen}, taste).empty()); // exclusion wins across duplicate pages
+    seen = favorite; seen.dropped = true; check(discovery::score(seen, taste) == -1);
+    seen = favorite; seen.favorite = true; check(discovery::score(seen, taste) == -1);
+    seen = favorite; seen.watching = true; check(discovery::score(seen, taste) == -1);
+    seen = favorite; seen.rating = std::numeric_limits<double>::quiet_NaN(); check(discovery::score(seen, taste) == -1);
+    seen = favorite; seen.rating = -1; check(discovery::score(seen, taste) == -1);
+    seen = favorite; seen.rating = 6; check(discovery::score(seen, taste) == -1);
+    seen = favorite; seen.id = 0; check(discovery::score(seen, taste) == -1);
+    check(discovery::rank({popular, favorite, favorite}, taste).size() == 2);
+    check(discovery::rank({popular, favorite}, taste, 1) == std::vector<long long>({1}));
+    check(discovery::rank({favorite}, taste, 0).empty());
+    check(discovery::rank({}, taste).empty());
+    seen = favorite; seen.id = 3;
+    check(discovery::rank({seen, favorite}, taste) == std::vector<long long>({1,3}));
+    check(discovery::validYearRange(0, 0, 2026));
+    check(discovery::validYearRange(2023, 2024, 2026));
+    check(discovery::validYearRange(2023, 0, 2026));
+    check(discovery::validYearRange(0, 2024, 2026));
+    check(!discovery::validYearRange(2024, 2023, 2026));
+    check(!discovery::validYearRange(1899, 2023, 2026));
+    check(!discovery::validYearRange(0, 2032, 2026));
+    std::cout << "PASS: " << total << " playback/discovery checks (production C++ headers).\n";
 }

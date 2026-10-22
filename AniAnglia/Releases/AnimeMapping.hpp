@@ -33,6 +33,17 @@ inline long uniqueAnime(const AnimeIdentity& source, const std::vector<AnimeIden
     }
     return selected;
 }
+// Verified MAL catalogue entry, not episode timing. Timings still come from AniSkip per video.
+// Source: https://myanimelist.net/anime/54595/Kage_no_Jitsuryokusha_ni_Naritakute_2nd_Season
+inline long verifiedAnime(const AnimeIdentity& source) {
+    const AnimeIdentity shadow2{54595, {
+        "kagenojitsuryokushaninaritakute2ndseason", "kagenojitsuryokushaninaritakute2",
+        "theeminenceinshadowseason2", "shadowgarden2ndseason",
+        "восхождениевтени2", "восхождениевтени2сезон", "восхождениевтенисезон2",
+        "восхождениевтени2йсезон", "восхождениевтенитв2", "陰の実力者になりたくて2ndseason"
+    }, 2023, 12, 1};
+    return matchingAnime(source, shadow2) ? shadow2.mal : 0;
+}
 // A source position is not necessarily a season episode number (including zero-based sources).
 // Named numbers are preferred. Unknown labels/specials never silently become normal episodes.
 inline long mappedEpisode(const std::vector<long>& positions, const std::vector<long>& numbers,

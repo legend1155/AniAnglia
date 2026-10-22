@@ -14,6 +14,8 @@
 #import "ReleasesHistoryTableViewController.h"
 #import "ReleasesViewController.h"
 #import "ProfileListsView.h"
+#import "../ModernStyle.h"
+#include "../DiscoveryPolicy.hpp"
 
 @class MultiSelectMenuModalViewController;
 
@@ -116,6 +118,8 @@
 @property(nonatomic, retain) MultiSelectMenuButton* age_rating_select_button;
 @property(nonatomic, retain) SingleSelectMenuButton* sort_select_button;
 @property(nonatomic, retain) UIButton* search_button;
+@property(nonatomic, strong) UITextField* startYearField;
+@property(nonatomic, strong) UITextField* endYearField;
 
 @end
 
@@ -198,8 +202,10 @@
     [_label sizeToFit];
 }
 -(void)setupLayout {
-    _label.textColor = [AppColorProvider textColor];
-    _button.layer.cornerRadius = 8;
+    _label.textColor = UIColor.labelColor;
+    _label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline]; _label.adjustsFontForContentSizeCategory = YES;
+    _button.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody]; _button.titleLabel.adjustsFontForContentSizeCategory = YES;
+    _button.layer.cornerRadius = 16;
     [_button setTitleColor:[AppColorProvider textColor] forState:UIControlStateNormal];
     _button.backgroundColor = [AppColorProvider foregroundColor1];
     self.backgroundColor = [UIColor clearColor];
@@ -239,7 +245,7 @@
     [_button setTitle:_title forState:UIControlStateNormal];
     [_button addTarget:self action:@selector(onButtonPressed:) forControlEvents:UIControlEventTouchUpInside];
     _button.showsMenuAsPrimaryAction = YES;
-    _button.layer.cornerRadius = 8;
+    _button.layer.cornerRadius = 16;
     
     [self addSubview:_label];
     [self addSubview:_button];
@@ -385,7 +391,7 @@
     _done_button = [UIButton new];
     [_done_button addTarget:self action:@selector(onDoneButtonPressed:) forControlEvents:UIControlEventTouchUpInside];
     [_done_button setTitle:NSLocalizedString(@"app.filter.multi_select.done", "") forState:UIControlStateNormal];
-    _done_button.layer.cornerRadius = 8;
+    _done_button.layer.cornerRadius = 16;
     
     [self.view addSubview:_blur_effect_view];
     [self.view addSubview:_content_view];
@@ -530,7 +536,10 @@
 }
 
 -(void)setup {
+    self.title = @"Расширенный поиск";
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Сбросить" style:UIBarButtonItemStylePlain target:self action:@selector(resetFilters)];
     _scroll_view = [UIScrollView new];
+    _scroll_view.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     _scroll_view.contentInset = UIEdgeInsetsMake(12, 0, 10, 0);
     _scroll_view.clipsToBounds = NO;
     
@@ -705,7 +714,7 @@
     _search_button = [UIButton new];
     [_search_button setTitle:NSLocalizedString(@"app.filter.search", "") forState:UIControlStateNormal];
     [_search_button addTarget:self action:@selector(onSearchButtonPressed:) forControlEvents:UIControlEventTouchUpInside];
-    _search_button.layer.cornerRadius = 8;
+    _search_button.layer.cornerRadius = 16;
     
     _genres_select_button.presenter = self;
     _types_select_button.presenter = self;
@@ -714,6 +723,19 @@
     
     [self.view addSubview:_scroll_view];
     [_scroll_view addSubview:_stack_view];
+    UILabel* help = [UILabel new]; help.numberOfLines = 0;
+    help.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline]; help.adjustsFontForContentSizeCategory = YES;
+    help.textColor = UIColor.secondaryLabelColor;
+    help.text = @"Подбор по каталогу: жанры, годы, формат и статус. Для названий, автора, студии и режиссёра используй строку поиска и меню результатов. Сортировка по рейтингу — ниже; порог рейтинга API не предоставляет.";
+    [_stack_view addArrangedSubview:help];
+    UILabel* yearLabel = [UILabel new]; yearLabel.text = @"Год выпуска — от и до";
+    yearLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline]; yearLabel.adjustsFontForContentSizeCategory = YES;
+    [_stack_view addArrangedSubview:yearLabel];
+    self.startYearField = [self yearFieldWithPlaceholder:@"С 1900"];
+    self.endYearField = [self yearFieldWithPlaceholder:@"По любой год"];
+    UIStackView* years = [[UIStackView alloc] initWithArrangedSubviews:@[self.startYearField, self.endYearField]];
+    years.distribution = UIStackViewDistributionFillEqually; years.spacing = 12;
+    [_stack_view addArrangedSubview:years];
     [_stack_view addArrangedSubview:_status_select_button];
     [_stack_view addArrangedSubview:_category_select_button];
     [_stack_view addArrangedSubview:_genres_select_button];
@@ -747,10 +769,10 @@
     _search_button.translatesAutoresizingMaskIntoConstraints = NO;
     
     [NSLayoutConstraint activateConstraints:@[
-        [_scroll_view.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_scroll_view.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
         [_scroll_view.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [_scroll_view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [_scroll_view.bottomAnchor constraintLessThanOrEqualToAnchor:self.view.bottomAnchor],
+        [_scroll_view.bottomAnchor constraintEqualToAnchor:_search_button.topAnchor constant:-12],
         
         [_stack_view.topAnchor constraintEqualToAnchor:_scroll_view.topAnchor],
         [_stack_view.leadingAnchor constraintEqualToAnchor:_scroll_view.leadingAnchor],
@@ -764,10 +786,10 @@
         [_genres_exclude_mode_button.widthAnchor constraintEqualToAnchor:_genres_select_button.button.layoutMarginsGuide.heightAnchor],
         [_genres_exclude_mode_button.heightAnchor constraintEqualToAnchor:_genres_select_button.button.layoutMarginsGuide.heightAnchor],
         
-        [_search_button.topAnchor constraintEqualToAnchor:_scroll_view.bottomAnchor],
+
         [_search_button.leadingAnchor constraintEqualToAnchor:_scroll_view.layoutMarginsGuide.leadingAnchor],
         [_search_button.trailingAnchor constraintEqualToAnchor:_scroll_view.layoutMarginsGuide.trailingAnchor],
-        [_search_button.heightAnchor constraintEqualToConstant:50],
+        [_search_button.heightAnchor constraintGreaterThanOrEqualToConstant:50],
         [_search_button.bottomAnchor constraintEqualToAnchor:self.view.layoutMarginsGuide.bottomAnchor],
     ]];
     
@@ -776,7 +798,8 @@
 
 -(void)setupLayout {
     self.view.backgroundColor = [AppColorProvider backgroundColor];
-    _search_button.backgroundColor = [AppColorProvider primaryColor];
+    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
+    AniStyleButton(_search_button, YES);
     [self updateGenresExcludeButton];
 }
 
@@ -972,7 +995,36 @@
     [self updateGenresExcludeButton];
 }
 
+-(UITextField*)yearFieldWithPlaceholder:(NSString*)placeholder {
+    UITextField* field = [UITextField new]; field.placeholder = placeholder; field.borderStyle = UITextBorderStyleRoundedRect;
+    field.keyboardType = UIKeyboardTypeNumberPad; field.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    field.adjustsFontForContentSizeCategory = YES; field.accessibilityLabel = placeholder;
+    [field.heightAnchor constraintGreaterThanOrEqualToConstant:48].active = YES;
+    UIToolbar* toolbar = [UIToolbar new]; [toolbar sizeToFit];
+    toolbar.items = @[[[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil], [[UIBarButtonItem alloc] initWithTitle:@"Готово" style:UIBarButtonItemStyleDone target:self action:@selector(endYearEditing)]];
+    field.inputAccessoryView = toolbar; return field;
+}
+-(void)endYearEditing { [self.view endEditing:YES]; }
+-(void)resetFilters {
+    [self.view endEditing:YES]; _filter_request = anixart::requests::FilterRequest{};
+    [_scroll_view removeFromSuperview]; [_search_button removeFromSuperview];
+    [self setup]; [self setupLayout];
+}
 -(IBAction)onSearchButtonPressed:(UIButton*)sender {
+    [self.view endEditing:YES];
+    NSString* from = [self.startYearField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+    NSString* to = [self.endYearField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+    NSCharacterSet* invalid = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet];
+    int currentYear = (int)[[NSCalendar currentCalendar] component:NSCalendarUnitYear fromDate:NSDate.date];
+    if ((from.length && (from.length != 4 || [from rangeOfCharacterFromSet:invalid].location != NSNotFound)) ||
+        (to.length && (to.length != 4 || [to rangeOfCharacterFromSet:invalid].location != NSNotFound)) ||
+        !discovery::validYearRange(from.intValue, to.intValue, currentYear)) {
+        UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"Проверь годы" message:@"Укажи четырёхзначные годы от 1900. Начальный год не должен быть позже конечного. Поля можно оставить пустыми." preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"ОК" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil]; return;
+    }
+    _filter_request.start_year = from.length ? std::optional<std::chrono::years>(std::chrono::years(from.intValue)) : std::nullopt;
+    _filter_request.end_year = to.length ? std::optional<std::chrono::years>(std::chrono::years(to.intValue)) : std::nullopt;
     anixart::FilterPages::UPtr pages = _api_proxy.api->search().filter_search(_filter_request, false, 0);
     
     ReleasesViewController* releases_view_controller = [[ReleasesViewController alloc] initWithPages:std::move(pages)];

@@ -21,12 +21,16 @@
 #import "SettingsViewController.h"
 #import "ReleasesViewController.h"
 #import "ProfilesTableViewController.h"
+#import "ModernStyle.h"
 
 @interface ReleasesSearchController : UIViewController <SearchViewControllerDataSource, SearchViewControllerDelegate, ReleasesSearchHistoryTableViewControllerDelegate>
 @property(nonatomic, strong) AppDataController* app_data_controller;
 @property(nonatomic, strong) LibanixartApi* api_proxy;
 @property(nonatomic, retain) SearchViewController* search_view_controller;
 @property(nonatomic, retain) ReleasesViewController* view_controller;
+@property(nonatomic) NSInteger searchMode;
+@property(nonatomic, copy) NSString* lastQuery;
+-(void)configureSearchMenu;
 
 -(instancetype)initWithQuery:(NSString*)query;
 
@@ -74,7 +78,10 @@
 }
 
 -(void)setQuery:(NSString *)query {
+    self.lastQuery = [query stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+    query = self.lastQuery;
     anixart::requests::SearchRequest request;
+    request.search_by = static_cast<anixart::requests::SearchRequest::SearchBy>(self.searchMode);
     request.query = TO_STDSTRING(query);
     anixart::ReleaseSearchPages::UPtr pages = _api_proxy.api->search().release_search(request, 0);
     
@@ -85,26 +92,52 @@
     [_search_view_controller setSearchText:query];
     _search_view_controller.data_source = self;
     _search_view_controller.delegate = self;
+    [self configureSearchMenu];
 }
 
+-(void)configureSearchMenu {
+    NSArray<NSString*>* names = @[@"По названию", @"По студии", @"По режиссёру", @"По автору", @"По жанру"];
+    NSMutableArray<UIAction*>* actions = [NSMutableArray new];
+    __weak ReleasesSearchController* weakSelf = self;
+    for (NSInteger i = 0; i < (NSInteger)names.count; ++i) {
+        UIAction* action = [UIAction actionWithTitle:names[i] image:[UIImage systemImageNamed:i == self.searchMode ? @"checkmark" : @"magnifyingglass"] identifier:nil handler:^(UIAction* selected) {
+            ReleasesSearchController* owner = weakSelf; if (!owner) return;
+            owner.searchMode = i; [owner configureSearchMenu];
+            [owner searchViewController:owner.search_view_controller didSearchWithQuery:owner.lastQuery];
+        }];
+        [actions addObject:action];
+    }
+    UIMenu* menu = [UIMenu menuWithTitle:@"Искать в каталоге" children:actions];
+    UIBarButtonItem* button = [[UIBarButtonItem alloc] initWithTitle:names[self.searchMode] image:nil primaryAction:nil menu:menu];
+    button.accessibilityLabel = @"Способ поиска аниме";
+    self.search_view_controller.right_bar_button = button;
+    self.search_view_controller.navigationItem.rightBarButtonItem = button;
+    [self.search_view_controller setSearchText:self.lastQuery];
+}
 -(UIViewController*)inlineViewControllerForSearchViewController:(SearchViewController*)search_view_controller {
     ReleasesSearchHistoryTableViewController* view_controller = [ReleasesSearchHistoryTableViewController new];
     view_controller.delegate = self;
     return view_controller;
 }
 -(void)searchViewController:(SearchViewController*)search_view_controller didSearchWithQuery:(NSString*)query {
+    query = [query stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!query.length) return;
+    self.lastQuery = query;
     [_app_data_controller addSearchHistoryItem:query];
     anixart::requests::SearchRequest request;
+    request.search_by = static_cast<anixart::requests::SearchRequest::SearchBy>(self.searchMode);
     request.query = TO_STDSTRING(query);
     anixart::ReleaseSearchPages::UPtr pages = _api_proxy.api->search().release_search(request, 0);
         
     [_view_controller setPages:std::move(pages)];
 }
 -(void)releasesSearchHistoryTableViewController:(ReleasesHistoryTableViewController*)history_table_view_controller didSelectHistoryItem:(NSString*)item_name {
+    self.lastQuery = item_name;
     [_search_view_controller setSearchText:item_name];
     [_search_view_controller endSearching];
     
     anixart::requests::SearchRequest request;
+    request.search_by = static_cast<anixart::requests::SearchRequest::SearchBy>(self.searchMode);
     request.query = TO_STDSTRING(item_name);
     anixart::ReleaseSearchPages::UPtr pages = _api_proxy.api->search().release_search(request, 0);
     
@@ -231,7 +264,12 @@
     self.view.backgroundColor = [AppColorProvider backgroundColor];
     self.tabBar.unselectedItemTintColor = [UIColor systemGrayColor];
     self.tabBar.tintColor = [AppColorProvider primaryColor];
-    self.tabBar.backgroundColor = [AppColorProvider backgroundColor];
+    UITabBarAppearance* appearance = [UITabBarAppearance new]; [appearance configureWithDefaultBackground];
+    appearance.backgroundEffect = UIAccessibilityIsReduceTransparencyEnabled() ? nil : [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
+    if (UIAccessibilityIsReduceTransparencyEnabled()) appearance.backgroundColor = UIColor.systemBackgroundColor;
+    self.tabBar.standardAppearance = appearance;
+    if (@available(iOS 15.0, *)) self.tabBar.scrollEdgeAppearance = appearance;
+    for (UINavigationController* navigation in self.viewControllers) AniStyleNavigation(navigation);
 }
 
 -(UIViewController*)inlineViewControllerForSearchViewController:(SearchViewController*)search_view_controller {

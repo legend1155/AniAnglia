@@ -34,13 +34,13 @@
     return [UIColor systemOrangeColor];
 }
 -(UIColor*)textColor {
-    return [UIColor whiteColor];
+    return UIColor.labelColor;
 }
 -(UIColor*)textSecondaryColor {
-    return [UIColor lightGrayColor];
+    return UIColor.secondaryLabelColor;
 }
 -(UIColor*)textShyColor {
-    return [UIColor grayColor];
+    return UIColor.tertiaryLabelColor;
 }
 @end
 
@@ -70,13 +70,13 @@
     return [UIColor systemOrangeColor];
 }
 -(UIColor*)textColor {
-    return [UIColor blackColor];
+    return UIColor.labelColor;
 }
 -(UIColor*)textSecondaryColor {
-    return [UIColor darkGrayColor];
+    return UIColor.secondaryLabelColor;
 }
 -(UIColor*)textShyColor {
-    return [UIColor grayColor];
+    return UIColor.tertiaryLabelColor;
 }
 @end
 

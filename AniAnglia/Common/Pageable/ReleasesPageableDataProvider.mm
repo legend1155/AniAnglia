@@ -9,9 +9,14 @@
 #import "ReleasesPageableDataProvider.h"
 #import "ProfileListsView.h"
 #import "StringCvt.h"
+#include <mutex>
 
 @interface ReleasesPageableDataProvider () {
-    anixart::Pageable<anixart::Release>::UPtr _pages;
+    anixart::Pageable<anixart::Release>::Ptr _pages;
+    std::mutex _pageMutex;
+    NSUInteger _requestGeneration;
+    BOOL _loading, _endReached, _pendingRefresh;
+    NSInteger _lastPageIndex;
     std::vector<anixart::Release::Ptr> _releases;
 }
 @property(nonatomic, readonly) BOOL is_needed_first_load;
@@ -79,126 +84,78 @@
 }
 
 -(instancetype)initWithPages:(anixart::Pageable<anixart::Release>::UPtr)pages {
-    self = [super init];
-    
-    _pages = std::move(pages);
-    _is_needed_first_load = static_cast<bool>(_pages);
-    
+    if ((self = [super init])) {
+        _pages = std::move(pages); _is_needed_first_load = static_cast<bool>(_pages); _endReached = !_pages;
+    }
     return self;
 }
-
 -(instancetype)initWithPages:(anixart::Pageable<anixart::Release>::UPtr)pages initialReleases:(std::vector<anixart::Release::Ptr>)releases {
-    self = [self initWithPages:std::move(pages)];
-    
-    _releases = std::move(releases);
-    
+    if ((self = [self initWithPages:std::move(pages)])) _releases = std::move(releases);
     return self;
 }
-
 -(void)clear {
-    // TODO: load cancel
-    _releases.clear();
-    [self callDelegateDidUpdate];
+    ++_requestGeneration; _loading = NO; _pendingRefresh = NO;
+    _releases.clear(); [self callDelegateDidUpdate];
 }
-
 -(void)reload {
-    _releases.clear();
-    [self callDelegateDidUpdate];
-    [self loadPageAtIndex:0];
+    if (_loading) { _pendingRefresh = YES; return; }
+    _releases.clear(); [self callDelegateDidUpdate]; [self loadPageAtIndex:0];
 }
-
 -(void)refresh {
+    if (_loading) { _pendingRefresh = YES; return; }
     [self loadPageAtIndex:0];
 }
-
 -(void)setPages:(anixart::Pageable<anixart::Release>::UPtr)pages {
-    _releases.clear();
-    _pages = std::move(pages);
-    [self callDelegateDidUpdate];
-    [self loadCurrentPage];
+    ++_requestGeneration; _loading = NO; _pendingRefresh = NO;
+    _releases.clear(); _pages = std::move(pages); _endReached = !_pages; _lastPageIndex = 0;
+    [self callDelegateDidUpdate]; [self loadCurrentPage];
 }
-
--(BOOL)isEnd {
-    if (!_pages) {
-        return YES;
-    }
-    return _pages->is_end();
-}
-
--(size_t)getItemsCount {
-    return _releases.size();
-}
-
+-(BOOL)isEnd { return _endReached; }
+-(size_t)getItemsCount { return _releases.size(); }
 -(anixart::Release::Ptr)getReleaseAtIndex:(NSInteger)index {
-    if (index >= _releases.size()) {
-        // wtf
-        return nullptr;
-    }
-    return _releases[index];
+    return index >= 0 && static_cast<std::size_t>(index) < _releases.size() ? _releases[static_cast<std::size_t>(index)] : nullptr;
 }
-
--(void)appendItemsFromBlock:(std::vector<anixart::Release::Ptr>(^)())block {
-    [self setItemsFromBlock:block isAppend:YES];
-}
-
--(void)setItemsFromBlock:(std::vector<anixart::Release::Ptr>(^)())block isAppend:(BOOL)is_append {
-    if (!_pages) {
-        return;
-    }
-    
-    __block decltype(block()) new_items;
+-(void)loadPageAtIndex:(NSInteger)index mode:(NSInteger)mode append:(BOOL)append {
+    if (!_pages || _loading) return;
+    _loading = YES; _is_needed_first_load = NO;
+    const auto pages = _pages; // Shared ownership: changing a query cannot destroy an in-flight pager.
+    const NSUInteger generation = _requestGeneration;
+    __block std::vector<anixart::Release::Ptr> items;
+    __block NSInteger loadedIndex = index;
+    __block BOOL endReached = NO;
+    if ([self.delegate respondsToSelector:@selector(pageableDataProvider:didBeginLoadingPageAtIndex:)])
+        [self.delegate pageableDataProvider:self didBeginLoadingPageAtIndex:index];
     [self.api_proxy asyncCall:^BOOL(anixart::Api* api) {
-        new_items = block();
+        (void)api;
+        // Also serialize refreshes of the same mutable pager after clear/replacement.
+        std::lock_guard<std::mutex> guard(self->_pageMutex);
+        items = mode == 1 ? pages->next() : (mode == 2 ? pages->go((int32_t)index) : pages->get());
+        loadedIndex = pages->get_current_page(); endReached = pages->is_end();
         return NO;
     } completion:^(BOOL errored) {
-        if (errored) {
-            [self callDelegateDidFailPageAtIndex:self->_pages->get_current_page()];
-            return;
+        if (generation != self->_requestGeneration) return; // Old query never changes new results or spinner.
+        self->_loading = NO;
+        if (errored) [self callDelegateDidFailPageAtIndex:index];
+        else {
+            if (append) self->_releases.insert(self->_releases.end(), items.begin(), items.end());
+            else self->_releases = std::move(items);
+            self->_lastPageIndex = loadedIndex; self->_endReached = endReached;
+            [self callDelegateDidLoadPageAtIndex:loadedIndex];
         }
-        if (is_append) {
-            self->_releases.insert(self->_releases.end(), new_items.begin(), new_items.end());
-        } else {
-            self->_releases = std::move(new_items);
-        }
-        [self callDelegateDidLoadPageAtIndex:self->_pages->get_current_page()];
+        if (self->_pendingRefresh) { self->_pendingRefresh = NO; [self refresh]; }
     }];
 }
-
--(void)loadCurrentPage {
-    _is_needed_first_load = NO;
-    [self appendItemsFromBlock:^() {
-        return self->_pages->get();
-    }];
-}
-
+-(void)loadCurrentPage { [self loadPageAtIndex:_lastPageIndex mode:0 append:NO]; }
 -(void)loadCurrentPageIfNeeded {
-    if (_is_needed_first_load) {
-        [self loadCurrentPage];
-        return;
-    }
-    
-    if (_pages) {
-        [self callDelegateDidLoadPageAtIndex:_pages->get_current_page()];
-    } else {
-        [self callDelegateDidLoadPageAtIndex:0];
-    }
+    if (_is_needed_first_load) [self loadCurrentPage];
+    else if (!_loading) [self callDelegateDidLoadPageAtIndex:_lastPageIndex];
 }
-
 -(void)loadNextPage {
-    if (_pages->is_end()) {
-        return;
-    }
-    [self appendItemsFromBlock:^() {
-        return self->_pages->next();
-    }];
+    if (!_pages || _endReached || _loading) return;
+    if (_is_needed_first_load) { [self loadCurrentPage]; return; }
+    [self loadPageAtIndex:_lastPageIndex + 1 mode:1 append:YES];
 }
-
--(void)loadPageAtIndex:(NSInteger)index {
-    __strong auto strong_self = self;
-    [self setItemsFromBlock:^{
-        return strong_self->_pages->go(static_cast<int32_t>(index));
-    } isAppend:NO];
-}
+-(void)loadPageAtIndex:(NSInteger)index { [self loadPageAtIndex:index mode:2 append:NO]; }
 
 -(UIAction*)makeContextMenuAction:(anixart::Profile::ListStatus)list_status toRelease:(anixart::Release::Ptr)release {
     UIImage* image = list_status == release->profile_list_status ? [UIImage systemImageNamed:@"checkmark"] : nil;

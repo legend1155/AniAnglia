@@ -13,6 +13,7 @@
 #import "StringCvt.h"
 #import "TypeSelectViewController.h"
 #import "PlayerViewController.h"
+#import "../Main/ModernStyle.h"
 #import "LoadableView.h"
 #import "TimeCvt.h"
 #import "DynamicTableView.h"
@@ -1046,6 +1047,10 @@
     [_bookmark_button setTitleColor:[AppColorProvider textColor] forState:UIControlStateNormal];
     _play_button.backgroundColor = [AppColorProvider primaryColor];
     [_play_button setTitleColor:[AppColorProvider textColor] forState:UIControlStateNormal];
+    _title_label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle2]; _title_label.adjustsFontForContentSizeCategory = YES;
+    _orig_title_label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline]; _orig_title_label.adjustsFontForContentSizeCategory = YES;
+    AniStyleButton(_play_button, YES); AniStyleButton(_add_list_button, NO); AniStyleButton(_bookmark_button, NO);
+    _release_image_view.layer.cornerRadius = 20;
     _note_label.textColor = [AppColorProvider textSecondaryColor];
 }
 

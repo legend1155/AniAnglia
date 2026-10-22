@@ -85,6 +85,9 @@ inline double parseTimestamp(std::string_view text) {
     }
     return -1;
 }
+inline bool shouldAutoAdvance(bool enabled, bool matchingItem, bool ready, bool advancing, bool hasNext) {
+    return enabled && matchingItem && ready && !advancing && hasNext;
+}
 inline bool shouldSkipEnding(double seconds, double duration, double length, bool hasNext) {
     return hasNext && std::isfinite(seconds) && std::isfinite(duration) && std::isfinite(length) && length > 0 &&
         duration > length + 30 && seconds >= duration - length && seconds < duration;
