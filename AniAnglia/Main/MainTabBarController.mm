@@ -108,7 +108,9 @@
         [actions addObject:action];
     }
     UIMenu* menu = [UIMenu menuWithTitle:@"Искать в каталоге" children:actions];
-    UIBarButtonItem* button = [[UIBarButtonItem alloc] initWithTitle:names[self.searchMode] image:nil primaryAction:nil menu:menu];
+    UIBarButtonItem* button = [[UIBarButtonItem alloc] initWithTitle:names[self.searchMode]
+        style:UIBarButtonItemStylePlain target:nil action:NULL];
+    button.menu = menu;
     button.accessibilityLabel = @"Способ поиска аниме";
     self.search_view_controller.right_bar_button = button;
     self.search_view_controller.navigationItem.rightBarButtonItem = button;

@@ -54,6 +54,12 @@ phases = re.findall(r'([A-F0-9]{24}) /\* Frameworks \*/ = \{\s*isa = PBXFramewor
 assert any(build_match[1] in body for _, body in phases), 'CoreMedia must be in the target Frameworks build phase'
 assert '#import <CoreMedia/CoreMedia.h>' in player
 print('PASS: CoreMedia SDK reference and target link-phase regression checks.')
+# Objective-C UIKit menu setup: do not use the Swift-shaped combined initializer.
+search_tabs = (root/'AniAnglia/Main/MainTabBarController.mm').read_text()
+assert 'image:nil primaryAction:nil menu:menu' not in search_tabs
+assert 'style:UIBarButtonItemStylePlain target:nil action:NULL' in search_tabs
+assert 'button.menu = menu;' in search_tabs
+print('PASS: search menu Objective-C initializer regression checks (static only).')
 home = (root/'AniAnglia/Main/MainViewController.mm').read_text()
 assert 'discovery::rank(candidates, taste, 24)' in home and 'officialGenres.find' in home
 assert 'generation != owner.generation' in home and 'HomeProfileKey' in home
