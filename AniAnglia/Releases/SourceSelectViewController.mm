@@ -13,6 +13,7 @@
 #import "LoadableView.h"
 #import "AppDataController.h"
 #include <algorithm>
+#include "PlaybackPolicy.hpp"
 
 @interface SourceViewCell : UITableViewCell
 @property(nonatomic, retain) UILabel* name_label;
@@ -176,12 +177,20 @@
     
     [_api_proxy asyncCall:^BOOL(anixart::Api* api) {
         self->_sources = api->episodes().get_release_sources(self->_release_id, self->_type_id);
+        self->_sources.erase(std::remove_if(self->_sources.begin(),self->_sources.end(),[](const auto& source) {
+            return !source || playback::retiredPlayerSource(source->name);
+        }),self->_sources.end());
         return NO;
     } completion:^(BOOL errored) {
         [self->_loadable_view endLoadingWithErrored:errored];
         if (!errored) {
             AppSettingsDataController* settings = [[AppDataController sharedInstance] getSettingsController];
-            NSMutableSet<NSString*>* known = [NSMutableSet setWithArray:[settings getSettingsObjectAtKey:@"known_source_names"] ?: @[]];
+            NSMutableSet<NSString*>* known = [NSMutableSet new];
+            for (NSString* old in [settings getSettingsObjectAtKey:@"known_source_names"] ?: @[]) {
+                if (!playback::retiredPlayerSource(TO_STDSTRING(old))) [known addObject:old];
+            }
+            NSString* preferred=[settings getSettingsObjectAtKey:@"preferred_source_name"];
+            if (preferred.length && playback::retiredPlayerSource(TO_STDSTRING(preferred))) [settings setSettingsObject:@"" atKey:@"preferred_source_name"];
             for (const auto& source : self->_sources) {
                 NSString* name = TO_NSSTRING(source->name);
                 if (name.length) [known addObject:name];

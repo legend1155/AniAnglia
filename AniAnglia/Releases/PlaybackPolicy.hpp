@@ -8,6 +8,20 @@
 #include <vector>
 
 namespace playback {
+// Source providers, not dubbing/type names. Reject the retired Libria player.
+inline bool retiredPlayerSource(std::string_view label) {
+    std::string key;
+    for (unsigned char c : label) if (std::isalnum(c) && c<128) key.push_back(static_cast<char>(std::tolower(c)));
+    return key.find("libria")!=std::string::npos || label.find("Либрия")!=std::string_view::npos ||
+        label.find("либрия")!=std::string_view::npos || label.find("Либриа")!=std::string_view::npos || label.find("либриа")!=std::string_view::npos;
+}
+
+// Bounded retries only for transient HTTP/URL loading failures, never missing entries or cancellation.
+inline bool retryOpeningRequest(int status,long errorCode,bool urlError,unsigned attempt) {
+    if (attempt>=2) return false;
+    if (status==429 || status==500 || status==502 || status==503 || status==504) return true;
+    return urlError && (errorCode==-1001 || errorCode==-1005 || errorCode==-1004 || errorCode==-1003 || errorCode==-1009);
+}
 inline int qualityNumber(std::string_view label) {
     int value = 0;
     for (unsigned char c : label) {

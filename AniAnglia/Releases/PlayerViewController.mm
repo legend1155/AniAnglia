@@ -1,4 +1,4 @@
-// Native playback lifecycle, resume, queue and source web fallback.
+// Native playback lifecycle, resume, queue, compact controls and AVPlayerLayer PiP.
 #import "PlayerViewController.h"
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
@@ -6,14 +6,17 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import "AppDataController.h"
 #import "StringCvt.h"
-#import <SafariServices/SafariServices.h>
+
 #include <cctype>
 #include <exception>
 #include <cmath>
 #include <algorithm>
+#include <set>
 
 #include "PlaybackPolicy.hpp"
 #include "AnimeMapping.hpp"
+#include "PlayerChromeLayout.hpp"
+#import "PlayerChrome.h"
 #include "../Main/WatchPolicy.hpp"
 #import "../Main/WatchHistory.h"
 
@@ -37,21 +40,42 @@ static NSString* PlaybackTime(double seconds) {
 
 // One public, app-owned control layer: AVKit does not expose native chrome visibility.
 // This avoids private KVO/selectors and keeps every overlay on the same visibility state.
-@interface PlayerViewController : UIViewController <UIGestureRecognizerDelegate>
+// The displayed layer is also the PiP source. No private AVKit view traversal.
+@interface AniVideoSurface : UIView
+@property(nonatomic, readonly) AVPlayerLayer* playerLayer;
+@end
+@implementation AniVideoSurface
++(Class)layerClass { return AVPlayerLayer.class; }
+-(AVPlayerLayer*)playerLayer { return (AVPlayerLayer*)self.layer; }
+@end
+
+@interface PlayerViewController : UIViewController <UIGestureRecognizerDelegate, AVPictureInPictureControllerDelegate, UIPopoverPresentationControllerDelegate>
 @property(nonatomic, strong) AVPlayerViewController* nativePlayer;
 @property(nonatomic, strong) UIButton* skipButton;
 @property(nonatomic, strong) UIButton* nextButton;
-@property(nonatomic, strong) UIButton* openingButton;
+@property(nonatomic, strong) UIButton* moreButton;
+@property(nonatomic, strong) AniVideoSurface* videoSurface;
+@property(nonatomic, strong) AVPictureInPictureController* pipController;
+@property(nonatomic) BOOL restoringPiP;
+@property(nonatomic) BOOL menuOpen;
 @property(nonatomic, strong) UIButton* closeButton;
 @property(nonatomic, strong) UIButton* playButton;
-@property(nonatomic, strong) UIStackView* actionStack;
-@property(nonatomic, strong) UIStackView* transportStack;
+@property(nonatomic, strong) UIButton* backButton;
+@property(nonatomic, strong) UIButton* forwardButton;
+@property(nonatomic, strong) UIButton* speedButton;
+
+@property(nonatomic, strong) UIView* shade;
+@property(nonatomic) CGRect lastChromeBounds;
+@property(nonatomic) float preferredRate;
+@property(nonatomic, strong) UIView* actionStack;
+@property(nonatomic, strong) UIView* transportStack;
 @property(nonatomic, strong) UILabel* playbackStatusLabel;
 @property(nonatomic, strong) UILabel* timeLabel;
-@property(nonatomic, strong) UISlider* timeline;
+@property(nonatomic, strong) AniPlayerSlider* timeline;
 @property(nonatomic) BOOL overlayHidden;
 @property(nonatomic) BOOL loading;
 @property(nonatomic) BOOL scrubbing;
+@property(nonatomic) NSUInteger seekSerial;
 @property(nonatomic) BOOL wasPlaying;
 @property(nonatomic) double hideDeadline;
 @property(nonatomic, strong) UIActivityIndicatorView* spinner;
@@ -66,124 +90,92 @@ static NSString* PlaybackTime(double seconds) {
 -(void)setSkipAvailable:(BOOL)available nextAvailable:(BOOL)hasNext;
 -(void)refreshTransport;
 -(void)revealControls;
+-(CGRect)chromeBounds;
+-(void)sliderChanged;
+-(void)attachPlayer:(AVPlayer*)player;
+-(void)tearDownPlayback;
 -(void)toggleControls;
 -(void)seekToSeconds:(double)seconds;
 @end
 @implementation PlayerViewController
 -(instancetype)init {
     if ((self = [super init])) {
-        _nativePlayer = [AVPlayerViewController new];
+        _nativePlayer = [AVPlayerViewController new]; _preferredRate=1;
         _nativePlayer.showsPlaybackControls = NO;
-        if (@available(iOS 14.2, *)) _nativePlayer.canStartPictureInPictureAutomaticallyFromInline = YES;
+        _nativePlayer.allowsPictureInPicturePlayback = NO; // Compatibility handle only; the visible AVPlayerLayer owns PiP.
     }
     return self;
 }
 -(UIButton*)buttonWithTitle:(NSString*)title action:(SEL)action {
-    UIButton* button = [UIButton buttonWithType:UIButtonTypeSystem];
-    [button setTitle:title forState:UIControlStateNormal];
-    [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    button.tintColor = UIColor.whiteColor;
-    button.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
-    button.titleLabel.adjustsFontForContentSizeCategory = YES;
-    button.titleLabel.numberOfLines = 2;
-    button.backgroundColor = UIAccessibilityIsReduceTransparencyEnabled() ? [UIColor colorWithWhite:0.10 alpha:1] : [UIColor colorWithWhite:1 alpha:0.06];
-    button.layer.cornerRadius = 22; button.clipsToBounds = YES;
-    button.layer.borderWidth = 0.5; button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.3].CGColor;
-    if (!UIAccessibilityIsReduceTransparencyEnabled()) {
-        UIVisualEffectView* glass = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
-        glass.frame = button.bounds; glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        glass.userInteractionEnabled = NO; [button insertSubview:glass atIndex:0];
-    }
-    [button.heightAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
-    [button.widthAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
-    button.contentEdgeInsets = UIEdgeInsetsMake(10, 16, 10, 16);
-    button.imageEdgeInsets = UIEdgeInsetsMake(0, -3, 0, 3);
-    button.accessibilityLabel = title;
+    AniPlayerButton* button=[[AniPlayerButton alloc] initWithFrame:CGRectZero];
+    [button setTitle:title forState:UIControlStateNormal]; button.accessibilityLabel=title;
     if (action) [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return button;
 }
 -(void)viewDidLoad {
-    [super viewDidLoad]; self.view.backgroundColor = UIColor.blackColor;
-    [self addChildViewController:self.nativePlayer];
-    [self.view addSubview:self.nativePlayer.view];
-    [self.nativePlayer didMoveToParentViewController:self];
-    self.nativePlayer.view.userInteractionEnabled = NO;
-    self.nativePlayer.view.translatesAutoresizingMaskIntoConstraints = NO;
-    [NSLayoutConstraint activateConstraints:@[
-        [self.nativePlayer.view.topAnchor constraintEqualToAnchor:self.view.topAnchor],
-        [self.nativePlayer.view.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
-        [self.nativePlayer.view.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [self.nativePlayer.view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor]
-    ]];
-    self.closeButton = [self buttonWithTitle:@"" action:@selector(closePressed)];
-    [self.closeButton setImage:[UIImage systemImageNamed:@"xmark"] forState:UIControlStateNormal];
-    self.closeButton.accessibilityLabel = @"Закрыть плеер";
-    self.skipButton = [self buttonWithTitle:@"Пропустить опенинг" action:@selector(skipPressed)];
-    [self.skipButton setImage:[UIImage systemImageNamed:@"forward.end.fill"] forState:UIControlStateNormal];
-    self.nextButton = [self buttonWithTitle:@"Далее" action:@selector(nextPressed)];
-    [self.nextButton setImage:[UIImage systemImageNamed:@"play.rectangle.on.rectangle"] forState:UIControlStateNormal];
-    self.openingButton = [self buttonWithTitle:@"Опенинг" action:@selector(openingPressed)];
-    [self.openingButton setImage:[UIImage systemImageNamed:@"slider.horizontal.3"] forState:UIControlStateNormal];
-    self.actionStack = [[UIStackView alloc] initWithArrangedSubviews:@[self.openingButton, self.skipButton, self.nextButton]];
-    self.actionStack.axis = UILayoutConstraintAxisVertical; self.actionStack.spacing = 8; self.actionStack.alignment = UIStackViewAlignmentTrailing;
-    self.playButton = [self buttonWithTitle:@"" action:@selector(playPressed)];
-    self.playButton.accessibilityLabel = @"Воспроизвести";
-    UIButton* back = [self buttonWithTitle:@"" action:@selector(backPressed)];
-    [back setImage:[UIImage systemImageNamed:@"gobackward.10"] forState:UIControlStateNormal]; back.accessibilityLabel = @"Назад на 10 секунд";
-    UIButton* forward = [self buttonWithTitle:@"" action:@selector(forwardPressed)];
-    [forward setImage:[UIImage systemImageNamed:@"goforward.10"] forState:UIControlStateNormal]; forward.accessibilityLabel = @"Вперёд на 10 секунд";
-    UIButton* speed = [self buttonWithTitle:@"Скорость" action:NULL];
-    NSMutableArray<UIAction*>* speeds = [NSMutableArray new];
-    __weak PlayerViewController* weakSelf = self;
-    for (NSNumber* value in @[@0.5, @1.0, @1.25, @1.5, @2.0]) {
-        [speeds addObject:[UIAction actionWithTitle:[NSString stringWithFormat:@"%@×", value] image:nil identifier:nil handler:^(UIAction* action) {
-            PlayerViewController* owner = weakSelf; if (!owner || owner.loading) return;
-            if (owner.onSeek) owner.onSeek(); owner.nativePlayer.player.rate = value.floatValue;
-            [owner revealControls];
-        }]];
-    }
-    speed.menu = [UIMenu menuWithTitle:@"Скорость воспроизведения" children:speeds]; speed.showsMenuAsPrimaryAction = YES;
-    AVRoutePickerView* route = [AVRoutePickerView new]; route.tintColor = UIColor.whiteColor; route.activeTintColor = UIColor.systemBlueColor;
-    [route.widthAnchor constraintEqualToConstant:44].active = YES; [route.heightAnchor constraintEqualToConstant:44].active = YES;
-    UIStackView* buttons = [[UIStackView alloc] initWithArrangedSubviews:@[back, self.playButton, forward, speed, route]];
-    buttons.spacing = 6; buttons.alignment = UIStackViewAlignmentCenter; buttons.distribution = UIStackViewDistributionEqualSpacing;
-    self.timeline = [UISlider new]; self.timeline.minimumValue = 0; self.timeline.maximumValue = 1;
-    self.timeline.tintColor = UIColor.whiteColor; self.timeline.accessibilityLabel = @"Позиция в серии";
+    [super viewDidLoad]; self.view.backgroundColor=UIColor.blackColor;
+    self.videoSurface=[AniVideoSurface new]; self.videoSurface.userInteractionEnabled=NO;
+    self.videoSurface.playerLayer.videoGravity=AVLayerVideoGravityResizeAspect;
+    self.videoSurface.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
+    self.videoSurface.frame=self.view.bounds; [self.view addSubview:self.videoSurface];
+    self.shade=[AniPlayerShade new]; self.shade.userInteractionEnabled=NO; self.shade.backgroundColor=UIColor.clearColor;
+    [self.view addSubview:self.shade];
+    self.closeButton=[self buttonWithTitle:@"" action:@selector(closePressed)]; ((AniPlayerButton*)self.closeButton).chromeStyle=2;
+    [self.closeButton setImage:AniPlayerIcon(@"xmark") forState:UIControlStateNormal]; self.closeButton.accessibilityLabel=@"Закрыть плеер";
+    self.skipButton=[self buttonWithTitle:@"Пропустить опенинг" action:@selector(skipPressed)];
+    [self.skipButton setImage:AniPlayerIcon(@"forward.end.fill") forState:UIControlStateNormal];
+    self.nextButton=[self buttonWithTitle:@"Далее" action:@selector(nextPressed)];
+    [self.nextButton setImage:AniPlayerIcon(@"forward.end.fill") forState:UIControlStateNormal];
+    self.moreButton=[self buttonWithTitle:@"" action:@selector(morePressed)];
+    [self.moreButton setImage:AniPlayerIcon(@"ellipsis") forState:UIControlStateNormal]; self.moreButton.accessibilityLabel=@"Меню плеера";
+    self.actionStack=[AniPlayerOverlay new];
+    for (UIButton* button in @[self.skipButton,self.nextButton]) [self.actionStack addSubview:button];
+    self.transportStack=[AniPlayerOverlay new];
+    self.playButton=[self buttonWithTitle:@"" action:@selector(playPressed)];
+    self.backButton=[self buttonWithTitle:@"" action:@selector(backPressed)]; self.forwardButton=[self buttonWithTitle:@"" action:@selector(forwardPressed)];
+    [self.backButton setImage:AniPlayerIcon(@"gobackward.10") forState:UIControlStateNormal]; self.backButton.accessibilityLabel=@"Назад на 10 секунд";
+    [self.forwardButton setImage:AniPlayerIcon(@"goforward.10") forState:UIControlStateNormal]; self.forwardButton.accessibilityLabel=@"Вперёд на 10 секунд";
+    for (UIButton* button in @[self.backButton,self.playButton,self.forwardButton]) ((AniPlayerButton*)button).chromeStyle=1;
+    self.speedButton=[self buttonWithTitle:@"Скорость" action:@selector(speedPressed)];
+    ((AniPlayerButton*)self.speedButton).chromeStyle=1; ((AniPlayerButton*)self.moreButton).chromeStyle=1; ((AniPlayerButton*)self.nextButton).chromeStyle=1;
+    self.timeline=[AniPlayerSlider new]; self.timeline.minimumValue=0; self.timeline.maximumValue=1; self.timeline.minimumTrackTintColor=UIColor.whiteColor;
+    self.timeline.maximumTrackTintColor=[UIColor colorWithWhite:1 alpha:0.22]; self.timeline.accessibilityLabel=@"Позиция в серии";
     [self.timeline addTarget:self action:@selector(scrubStarted) forControlEvents:UIControlEventTouchDown];
-    [self.timeline addTarget:self action:@selector(scrubFinished) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+    [self.timeline addTarget:self action:@selector(scrubFinished) forControlEvents:UIControlEventTouchUpInside|UIControlEventTouchUpOutside];
     [self.timeline addTarget:self action:@selector(scrubCancelled) forControlEvents:UIControlEventTouchCancel];
-    self.timeLabel = [UILabel new]; self.timeLabel.textColor = UIColor.whiteColor; self.timeLabel.textAlignment = NSTextAlignmentCenter;
-    self.timeLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1]; self.timeLabel.adjustsFontForContentSizeCategory = YES;
-    self.transportStack = [[UIStackView alloc] initWithArrangedSubviews:@[buttons, self.timeline, self.timeLabel]];
-    self.transportStack.axis = UILayoutConstraintAxisVertical; self.transportStack.spacing = 4;
-    self.playbackStatusLabel = [UILabel new]; self.playbackStatusLabel.textColor = UIColor.whiteColor;
-    self.playbackStatusLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1];
-    self.playbackStatusLabel.adjustsFontForContentSizeCategory = YES; self.playbackStatusLabel.numberOfLines = 2;
-    self.playbackStatusLabel.textAlignment = NSTextAlignmentCenter;
-    for (UIView* control in @[self.closeButton, self.actionStack, self.transportStack, self.playbackStatusLabel]) {
-        [self.view addSubview:control]; control.translatesAutoresizingMaskIntoConstraints = NO;
-    }
-    UILayoutGuide* safe = self.view.safeAreaLayoutGuide;
-    [NSLayoutConstraint activateConstraints:@[
-        [self.closeButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.closeButton.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
-        [self.playbackStatusLabel.leadingAnchor constraintEqualToAnchor:self.closeButton.trailingAnchor constant:12],
-        [self.playbackStatusLabel.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.playbackStatusLabel.centerYAnchor constraintEqualToAnchor:self.closeButton.centerYAnchor],
-        [self.transportStack.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.transportStack.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.transportStack.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8],
-        [self.actionStack.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.actionStack.bottomAnchor constraintEqualToAnchor:self.transportStack.topAnchor constant:-12],
-        [self.actionStack.widthAnchor constraintLessThanOrEqualToAnchor:safe.widthAnchor constant:-24]
-    ]];
-    self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
-    self.spinner.color = UIColor.whiteColor; self.spinner.hidesWhenStopped = YES;
-    [self.view addSubview:self.spinner]; self.spinner.translatesAutoresizingMaskIntoConstraints = NO;
-    [NSLayoutConstraint activateConstraints:@[[self.spinner.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor], [self.spinner.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor]]];
-    UITapGestureRecognizer* tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggleControls)];
-    tap.delegate = self; tap.cancelsTouchesInView = NO; [self.view addGestureRecognizer:tap];
-    [self setSkipAvailable:NO nextAvailable:NO]; [self revealControls];
+    [self.timeline addTarget:self action:@selector(sliderChanged) forControlEvents:UIControlEventValueChanged];
+    self.timeLabel=[UILabel new]; self.timeLabel.textColor=UIColor.whiteColor; self.timeLabel.textAlignment=NSTextAlignmentCenter;
+    self.timeLabel.font=[UIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightRegular];
+    self.playbackStatusLabel=[UILabel new]; self.playbackStatusLabel.textColor=[UIColor colorWithWhite:1 alpha:0.88];
+    self.playbackStatusLabel.font=[UIFont systemFontOfSize:14]; self.playbackStatusLabel.alpha=0; self.playbackStatusLabel.accessibilityElementsHidden=YES; self.playbackStatusLabel.numberOfLines=1; self.playbackStatusLabel.textAlignment=NSTextAlignmentCenter;
+    for (UIView* control in @[self.timeline,self.backButton,self.playButton,self.forwardButton,self.timeLabel,self.speedButton,self.moreButton]) [self.transportStack addSubview:control];
+    for (UIView* control in @[self.closeButton,self.actionStack,self.transportStack,self.playbackStatusLabel]) [self.view addSubview:control];
+    self.spinner=[[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge]; self.spinner.color=UIColor.whiteColor; self.spinner.hidesWhenStopped=YES;
+    [self.view addSubview:self.spinner];
+    UITapGestureRecognizer* tap=[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggleControls)]; tap.delegate=self; tap.cancelsTouchesInView=NO;
+    [self.view addGestureRecognizer:tap]; [self setSkipAvailable:NO nextAvailable:NO]; [self revealControls];
+}
+-(CGRect)chromeBounds {
+    CGRect safe=self.view.safeAreaLayoutGuide.layoutFrame;
+    CGRect video=[self.videoSurface convertRect:self.videoSurface.playerLayer.videoRect toView:self.view];
+    CGRect visible=CGRectIntersection(safe,video);
+    return CGRectIsNull(visible) || CGRectIsEmpty(visible) || visible.size.width<240 || visible.size.height<120 ? safe : visible;
+}
+-(void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews]; self.actionStack.frame=self.view.bounds; self.transportStack.frame=self.view.bounds;
+    CGRect bounds=[self chromeBounds]; self.lastChromeBounds=bounds;
+    auto layout=playback::chromeLayout(bounds.origin.x,bounds.origin.y,bounds.size.width,bounds.size.height,!self.skipButton.hidden,!self.nextButton.hidden,UIContentSizeCategoryIsAccessibilityCategory(self.traitCollection.preferredContentSizeCategory));
+    auto rect=[](playback::ChromeRect r){return CGRectMake(r.x,r.y,r.w,r.h);};
+    CGRect safe=self.view.safeAreaLayoutGuide.layoutFrame;
+    self.closeButton.frame=CGRectMake(safe.origin.x+12,safe.origin.y+4,44,44); self.playbackStatusLabel.frame=CGRectZero;
+    [self.skipButton setTitle:layout.shortVideo ? @"Пропустить" : @"Пропустить опенинг" forState:UIControlStateNormal]; self.skipButton.accessibilityLabel=@"Пропустить опенинг";
+    self.skipButton.frame=rect(layout.skip); self.nextButton.frame=rect(layout.next);
+    self.timeline.frame=rect(layout.slider); self.timeLabel.frame=rect(layout.time);
+    self.backButton.frame=rect(layout.back); self.playButton.frame=rect(layout.play); self.forwardButton.frame=rect(layout.forward);
+    self.speedButton.frame=rect(layout.speed); self.moreButton.frame=rect(layout.more);
+    [self.speedButton setTitle:layout.speed.w<80 ? [NSString stringWithFormat:@"%.2g×",self.preferredRate] : @"Скорость" forState:UIControlStateNormal];
+    self.shade.frame=CGRectMake(bounds.origin.x,CGRectGetMaxY(bounds)-160,bounds.size.width,160); [self.shade setNeedsDisplay];
+    self.spinner.center=CGPointMake(CGRectGetMidX(self.view.bounds),CGRectGetMidY(self.view.bounds));
 }
 -(BOOL)gestureRecognizer:(UIGestureRecognizer*)recognizer shouldReceiveTouch:(UITouch*)touch {
     for (UIView* view = touch.view; view && view != self.view; view = view.superview) {
@@ -191,14 +183,22 @@ static NSString* PlaybackTime(double seconds) {
     }
     return YES;
 }
--(void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    self.actionStack.axis = self.view.bounds.size.width > self.view.bounds.size.height && !UIContentSizeCategoryIsAccessibilityCategory(self.traitCollection.preferredContentSizeCategory) ? UILayoutConstraintAxisHorizontal : UILayoutConstraintAxisVertical;
-}
--(void)fitVideo { self.nativePlayer.videoGravity = AVLayerVideoGravityResizeAspect; [self.view setNeedsLayout]; }
+-(void)fitVideo { self.videoSurface.playerLayer.videoGravity = AVLayerVideoGravityResizeAspect; [self.view setNeedsLayout]; }
 -(void)setOverlayHidden:(BOOL)hidden {
     _overlayHidden = hidden;
-    for (UIView* view in @[self.closeButton, self.actionStack, self.transportStack, self.playbackStatusLabel]) view.hidden = hidden;
+    NSArray<UIView*>* controls=@[self.closeButton, self.actionStack, self.transportStack, self.playbackStatusLabel, self.shade];
+    if (!self.isViewLoaded) return;
+    for (UIView* view in controls) { [view.layer removeAllAnimations]; if (!hidden && view!=self.playbackStatusLabel) view.hidden=NO; }
+    void (^changes)(void)=^{
+        for (UIView* view in controls) view.alpha=(hidden || view==self.playbackStatusLabel) ? 0 : 1;
+    };
+    if (UIAccessibilityIsReduceMotionEnabled()) {
+        changes(); for (UIView* view in controls) view.hidden = hidden;
+    } else {
+        [UIView animateWithDuration:0.18 delay:0 options:UIViewAnimationOptionBeginFromCurrentState|UIViewAnimationOptionAllowUserInteraction animations:changes completion:^(BOOL finished) {
+            if (finished && self.overlayHidden==hidden) for (UIView* view in controls) view.hidden = hidden;
+        }];
+    }
 }
 -(void)revealControls { self.overlayHidden = NO; self.hideDeadline = NSProcessInfo.processInfo.systemUptime + 4; }
 -(void)toggleControls { if (self.overlayHidden) [self revealControls]; else self.overlayHidden = YES; }
@@ -208,40 +208,171 @@ static NSString* PlaybackTime(double seconds) {
     BOOL valid = std::isfinite(seconds) && std::isfinite(duration) && duration > 0;
     self.timeline.enabled = valid && !self.loading;
     if (!self.scrubbing && valid) self.timeline.value = (float)(seconds / duration);
+    if (!CGRectEqualToRect(self.lastChromeBounds,[self chromeBounds])) [self.view setNeedsLayout];
+    if (self.scrubbing && valid) seconds=self.timeline.value*duration;
+    self.timeline.accessibilityValue=valid ? [NSString stringWithFormat:@"%@ из %@",PlaybackTime(seconds),PlaybackTime(duration)] : @"Загрузка";
     self.timeLabel.text = valid ? [NSString stringWithFormat:@"%@ / %@", PlaybackTime(seconds), PlaybackTime(duration)] : @"— / —";
-    BOOL playing = player.rate > 0;
-    [self.playButton setImage:[UIImage systemImageNamed:playing ? @"pause.fill" : @"play.fill"] forState:UIControlStateNormal];
+    BOOL playing = player.timeControlStatus == AVPlayerTimeControlStatusPlaying;
+    [self.playButton setImage:AniPlayerIcon(playing ? @"pause.fill" : @"play.fill") forState:UIControlStateNormal];
     self.playButton.accessibilityLabel = playing ? @"Пауза" : @"Воспроизвести";
     if (!playing && self.wasPlaying) [self revealControls];
     if (playing && !self.wasPlaying) self.hideDeadline = NSProcessInfo.processInfo.systemUptime + 4;
     self.wasPlaying = playing;
     if (UIAccessibilityIsVoiceOverRunning() || UIAccessibilityIsSwitchControlRunning()) [self revealControls];
-    if (discovery::controlsShouldHide(self.overlayHidden, playing, self.scrubbing || self.presentedViewController != nil || self.loading,
+    if (discovery::controlsShouldHide(self.overlayHidden, playing, self.scrubbing || self.menuOpen || self.presentedViewController != nil || self.loading,
                                      UIAccessibilityIsVoiceOverRunning() || UIAccessibilityIsSwitchControlRunning(), NSProcessInfo.processInfo.systemUptime, self.hideDeadline)) self.overlayHidden = YES;
 }
 -(void)setLoading:(BOOL)loading {
     [self loadViewIfNeeded]; _loading = loading;
     if (loading) [self.spinner startAnimating]; else [self.spinner stopAnimating];
-    self.skipButton.enabled = !loading; self.nextButton.enabled = !loading; self.openingButton.enabled = !loading; self.playButton.enabled = !loading;
-    self.nativePlayer.showsPlaybackControls = NO; self.scrubbing = NO; [self revealControls]; [self refreshTransport];
+    self.skipButton.enabled = !loading; self.nextButton.enabled = !loading; self.moreButton.enabled = !loading; self.playButton.enabled = !loading; self.backButton.enabled=!loading; self.forwardButton.enabled=!loading; self.speedButton.enabled=!loading;
+    self.nativePlayer.showsPlaybackControls = NO; self.scrubbing = NO; ++self.seekSerial; [self revealControls]; [self refreshTransport];
 }
--(void)setSkipAvailable:(BOOL)available nextAvailable:(BOOL)hasNext { self.skipButton.hidden = !available; self.nextButton.hidden = !hasNext; }
--(void)playPressed { if (self.loading) return; if (self.nativePlayer.player.rate > 0) [self.nativePlayer.player pause]; else [self.nativePlayer.player play]; [self revealControls]; [self refreshTransport]; }
+-(void)setSkipAvailable:(BOOL)available nextAvailable:(BOOL)hasNext {
+    if (self.skipButton.hidden!=!available || self.nextButton.hidden!=!hasNext) [self.view setNeedsLayout];
+    self.skipButton.hidden=!available; self.nextButton.hidden=!hasNext;
+}
+-(void)playPressed { if (self.loading) return; if (self.nativePlayer.player.rate > 0) [self.nativePlayer.player pause]; else self.nativePlayer.player.rate=self.preferredRate; [self revealControls]; [self refreshTransport]; }
 -(void)seekToSeconds:(double)seconds {
     double duration = CMTimeGetSeconds(self.nativePlayer.player.currentItem.duration);
     if (self.loading || !std::isfinite(seconds) || !std::isfinite(duration) || duration <= 0) return;
     if (self.onSeek) self.onSeek();
-    [self.nativePlayer.player seekToTime:CMTimeMakeWithSeconds(MAX(0, MIN(seconds, duration)), 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+    self.scrubbing=YES; NSUInteger serial=++self.seekSerial; AVPlayerItem* item=self.nativePlayer.player.currentItem;
+    __weak PlayerViewController* weakSelf=self;
+    CMTime tolerance=CMTimeMakeWithSeconds(0.2,600);
+    [self.nativePlayer.player seekToTime:CMTimeMakeWithSeconds(MAX(0,MIN(seconds,duration)),600) toleranceBefore:tolerance toleranceAfter:tolerance completionHandler:^(BOOL finished) {
+        dispatch_async(dispatch_get_main_queue(),^{
+            PlayerViewController* owner=weakSelf;
+            if (!owner || serial!=owner.seekSerial || item!=owner.nativePlayer.player.currentItem) return;
+            owner.scrubbing=NO; [owner revealControls]; [owner refreshTransport];
+        });
+    }];
     [self revealControls];
 }
 -(void)backPressed { [self seekToSeconds:CMTimeGetSeconds(self.nativePlayer.player.currentTime) - 10]; }
 -(void)forwardPressed { [self seekToSeconds:CMTimeGetSeconds(self.nativePlayer.player.currentTime) + 10]; }
--(void)scrubStarted { self.scrubbing = YES; if (self.onSeek) self.onSeek(); [self revealControls]; }
+-(void)scrubStarted { ++self.seekSerial; self.scrubbing = YES; if (self.onSeek) self.onSeek(); [self revealControls]; }
 -(void)scrubFinished { self.scrubbing = NO; [self seekToSeconds:self.timeline.value * CMTimeGetSeconds(self.nativePlayer.player.currentItem.duration)]; }
+-(void)sliderChanged {
+    if (UIAccessibilityIsVoiceOverRunning() || UIAccessibilityIsSwitchControlRunning()) { self.scrubbing=NO; [self seekToSeconds:self.timeline.value*CMTimeGetSeconds(self.nativePlayer.player.currentItem.duration)]; }
+    [self refreshTransport];
+}
 -(void)scrubCancelled { self.scrubbing = NO; [self revealControls]; }
 -(void)skipPressed { [self revealControls]; if (self.onSkip) self.onSkip(); }
 -(void)nextPressed { [self revealControls]; if (self.onNext) self.onNext(); }
--(void)openingPressed { [self revealControls]; if (self.onOpening) self.onOpening(); }
+-(void)attachPlayer:(AVPlayer*)player {
+    [self loadViewIfNeeded];
+    self.nativePlayer.player=player; // Retain the existing public getPlayer compatibility API.
+    self.videoSurface.playerLayer.player=player;
+    if (!self.pipController && [AVPictureInPictureController isPictureInPictureSupported]) {
+        self.pipController=[[AVPictureInPictureController alloc] initWithPlayerLayer:self.videoSurface.playerLayer];
+        self.pipController.delegate=self;
+        if (@available(iOS 14.2, *)) self.pipController.canStartPictureInPictureAutomaticallyFromInline=YES;
+    }
+}
+-(void)tearDownPlayback {
+    self.closing=YES; self.pipController.delegate=nil;
+    if (self.pipController.isPictureInPictureActive) [self.pipController stopPictureInPicture];
+    self.pipController=nil; self.videoSurface.playerLayer.player=nil; self.nativePlayer.player=nil;
+}
+-(void)showPiPMessage:(NSString*)message {
+    UIAlertController* alert=[UIAlertController alertControllerWithTitle:@"Картинка в картинке" message:message preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"ОК" style:UIAlertActionStyleCancel handler:nil]];
+    if (!self.presentedViewController && self.presentingViewController) [self presentViewController:alert animated:YES completion:nil];
+}
+-(void)startPiP {
+    [self revealControls];
+    if (!self.pipController) { [self showPiPMessage:@"Устройство не поддерживает плавающее окно для этого видео."]; return; }
+    if (self.pipController.isPictureInPictureActive) return;
+    if (!self.pipController.isPictureInPicturePossible) { [self showPiPMessage:@"Плавающее окно пока недоступно. Дождись загрузки видео и попробуй снова. Доступность также зависит от формата потока и системных настроек."]; return; }
+    [self.pipController startPictureInPicture];
+}
+-(void)showAirPlay {
+    UIViewController* routes=[UIViewController new]; routes.view.backgroundColor=UIColor.secondarySystemBackgroundColor;
+    routes.preferredContentSize=CGSizeMake(280,100); routes.modalPresentationStyle=UIModalPresentationPopover;
+    UILabel* title=[UILabel new]; title.text=@"Выбрать устройство AirPlay"; title.font=[UIFont systemFontOfSize:15]; title.textColor=UIColor.labelColor; title.frame=CGRectMake(16,8,248,28);
+    AVRoutePickerView* picker=[[AVRoutePickerView alloc] initWithFrame:CGRectMake(114,40,52,52)]; picker.tintColor=UIColor.labelColor; picker.activeTintColor=UIColor.systemBlueColor; picker.prioritizesVideoDevices=YES;
+    [routes.view addSubview:title]; [routes.view addSubview:picker];
+    routes.popoverPresentationController.sourceView=self.moreButton; routes.popoverPresentationController.sourceRect=self.moreButton.bounds;
+    routes.popoverPresentationController.delegate=self;
+    [self presentViewController:routes animated:YES completion:nil];
+}
+-(UIModalPresentationStyle)adaptivePresentationStyleForPresentationController:(UIPresentationController*)controller { return UIModalPresentationNone; }
+-(void)speedPressed {
+    [self revealControls]; self.menuOpen=YES;
+    UIAlertController* menu=[UIAlertController alertControllerWithTitle:@"Скорость воспроизведения" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak PlayerViewController* weakSelf=self;
+    for (NSNumber* value in @[@0.5,@1.0,@1.25,@1.5,@2.0]) {
+        [menu addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@×",value] style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+            PlayerViewController* owner=weakSelf; owner.menuOpen=NO; if (!owner || owner.loading) return;
+            owner.preferredRate=value.floatValue;
+            if (owner.onSeek) owner.onSeek();
+            if (owner.nativePlayer.player.rate>0) owner.nativePlayer.player.rate=owner.preferredRate;
+            [owner revealControls]; [owner.view setNeedsLayout];
+        }]];
+    }
+    [menu addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:^(UIAlertAction* action) { weakSelf.menuOpen=NO; [weakSelf revealControls]; }]];
+    menu.popoverPresentationController.sourceView=self.speedButton; menu.popoverPresentationController.sourceRect=self.speedButton.bounds; menu.popoverPresentationController.delegate=self;
+    [self presentViewController:menu animated:YES completion:nil];
+}
+-(void)finishMenu:(UIAlertController*)menu action:(void (^)(void))action {
+    // Dismiss the sheet, never the full-screen player, before showing another UI.
+    if (menu.presentingViewController) [menu dismissViewControllerAnimated:YES completion:action];
+    else if (action) action();
+}
+-(void)morePressed {
+    [self revealControls]; self.menuOpen=YES;
+    UIAlertController* menu=[UIAlertController alertControllerWithTitle:nil message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak PlayerViewController* weakSelf=self;
+    __weak UIAlertController* weakMenu=menu;
+    [menu addAction:[UIAlertAction actionWithTitle:@"Картинка в картинке" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+        PlayerViewController* owner=weakSelf; owner.menuOpen=NO;
+        [owner finishMenu:weakMenu action:^{ [weakSelf startPiP]; }];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"AirPlay" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+        PlayerViewController* owner=weakSelf; owner.menuOpen=NO;
+        [owner finishMenu:weakMenu action:^{ [weakSelf showAirPlay]; }];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Метки и диагностика автоскипа" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+        PlayerViewController* owner=weakSelf; owner.menuOpen=NO;
+        [owner finishMenu:weakMenu action:^{ if (weakSelf.onOpening) weakSelf.onOpening(); [weakSelf refreshTransport]; }];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:^(UIAlertAction* action) { weakSelf.menuOpen=NO; [weakSelf revealControls]; }]];
+    menu.popoverPresentationController.sourceView=self.moreButton; menu.popoverPresentationController.sourceRect=self.moreButton.bounds;
+    menu.popoverPresentationController.delegate=self;
+    [self presentViewController:menu animated:YES completion:nil];
+}
+-(void)presentationControllerDidDismiss:(UIPresentationController*)controller { self.menuOpen=NO; [self revealControls]; }
+-(void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController*)controller { if (controller==self.pipController) self.pipActive=YES; }
+-(void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController*)controller {
+    if (controller!=self.pipController) return;
+    self.pipActive=YES; self.overlayHidden=YES;
+    // Keep PlayerController and the visible source layer alive while browsing the app.
+    if (UIApplication.sharedApplication.applicationState==UIApplicationStateActive && self.presentingViewController && !self.presentedViewController) [self dismissViewControllerAnimated:YES completion:nil];
+}
+-(void)pictureInPictureController:(AVPictureInPictureController*)controller failedToStartPictureInPictureWithError:(NSError*)error {
+    if (controller!=self.pipController) return;
+    self.pipActive=NO; [self revealControls]; [self showPiPMessage:error.localizedDescription ?: @"Не удалось запустить плавающее окно."];
+}
+-(void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController*)controller {
+    if (controller!=self.pipController) return;
+    self.pipActive=NO;
+    if (!self.presentingViewController && !self.restoringPiP && !self.closing) { self.closing=YES; if (self.onClose) self.onClose(); }
+    else [self revealControls];
+}
+-(void)pictureInPictureController:(AVPictureInPictureController*)controller restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL))completion {
+    if (controller!=self.pipController || self.closing) { completion(NO); return; }
+    if (self.presentingViewController) { [self revealControls]; completion(YES); return; }
+    self.restoringPiP=YES;
+    UIViewController* top=nil;
+    for (UIScene* scene in UIApplication.sharedApplication.connectedScenes) {
+        if (scene.activationState!=UISceneActivationStateForegroundActive || ![scene isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow* window in ((UIWindowScene*)scene).windows) if (window.isKeyWindow) top=window.rootViewController;
+    }
+    while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) top=top.presentedViewController;
+    if (!top || top.isBeingDismissed) { self.restoringPiP=NO; completion(NO); return; }
+    [top presentViewController:self animated:YES completion:^{ self.restoringPiP=NO; [self revealControls]; completion(YES); }];
+}
 -(void)closePressed { self.closing = YES; if (self.onClose) self.onClose(); [self dismissViewControllerAnimated:YES completion:nil]; }
 -(void)viewDidDisappear:(BOOL)animated { [super viewDidDisappear:animated]; if (self.isBeingDismissed && !self.pipActive && !self.closing && self.onClose) self.onClose(); }
 -(UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAllButUpsideDown; }
@@ -288,6 +419,10 @@ static NSString* PlaybackTime(double seconds) {
 @property(nonatomic, copy) NSDictionary<NSNumber*, NSString*>* episodeNames;
 @property(nonatomic) BOOL mappingAttempted;
 @property(nonatomic) NSTimeInterval lastJikanRequest;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber*,NSArray<NSString*>*>* releaseSearchQueries;
+@property(nonatomic, copy) NSArray<NSString*>* mappingQueries;
+@property(nonatomic) NSUInteger mappingQueryIndex;
+@property(nonatomic) double openingDeadline;
 -(NSDictionary*)currentReleaseMetadata;
 -(NSDictionary*)automaticOpeningBinding;
 -(void)resolveAutomaticOpening;
@@ -307,6 +442,8 @@ static NSString* PlaybackTime(double seconds) {
 -(void)beginWatchTracking;
 -(void)sampleWatchAt:(double)seconds;
 -(void)applicationBackgrounded;
+-(void)performOpeningRequest:(NSURLRequest*)request attempt:(NSUInteger)attempt generation:(NSUInteger)generation version:(NSUInteger)version completion:(void(^)(NSData*,NSURLResponse*,NSError*))completion;
+-(BOOL)advanceOpeningQuery:(NSDictionary*)metadata generation:(NSUInteger)generation version:(NSUInteger)version;
 -(void)watchHistoryReset:(NSNotification*)notification;
 @end
 
@@ -323,7 +460,9 @@ static NSString* PlaybackTime(double seconds) {
     _openingStatus = [status copy];
     if (!self.player_view_controller.isViewLoaded) return;
     BOOL applied = [status containsString:@"Применено автоматически"] || [status containsString:@"Границы сохранены"];
-    NSString* badge = applied ? @"Опенинг · готов" : ([status containsString:@"…"] ? @"AniSkip · загрузка" : @"AniSkip · подробности в меню «Опенинг»");
+    NSString* badge=applied ? @"Опенинг · готов" : ([status containsString:@"…"] ? @"AniSkip · загрузка" : @"Опенинг · нет данных");
+    if ([status containsString:@"нет op-разметки"]) badge=@"Опенинг · нет разметки";
+    if ([status containsString:@"Версия видео отличается"]) badge=@"Опенинг · проверить";
     self.player_view_controller.playbackStatusLabel.text = status.length ? badge : @"";
 }
 -(void)showOpeningDiagnostics {
@@ -345,6 +484,7 @@ static NSString* PlaybackTime(double seconds) {
     if (self.watchSeconds.count && static_cast<int64_t>(release->id) == self.watchReleaseKey.longLongValue) self.watchDirty = YES;
     NSArray* raw = @[TO_NSSTRING(release->title_original) ?: @"", TO_NSSTRING(release->title_alt) ?: @"", TO_NSSTRING(release->title_ru) ?: @""];
     NSMutableOrderedSet<NSString*>* titles = [NSMutableOrderedSet new];
+    NSMutableOrderedSet<NSString*>* searches=[NSMutableOrderedSet new];
     NSString* query = nil;
     for (NSString* title in raw) {
         // Split explicit alias separators, not slashes in titles such as Fate/stay night.
@@ -352,10 +492,13 @@ static NSString* PlaybackTime(double seconds) {
         for (NSString* alias in [separated componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"\n;" ]]) {
             NSString* trimmed = [alias stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
             if (!query.length && trimmed.length) query = trimmed;
+            if (trimmed.length>=3) [searches addObject:trimmed];
             NSString* normalized = PlaybackNormalizedTitle(trimmed);
             if (normalized.length >= 3) [titles addObject:normalized];
         }
     }
+    if (!self.releaseSearchQueries) self.releaseSearchQueries=[NSMutableDictionary new];
+    self.releaseSearchQueries[@(static_cast<int64_t>(release->id))]=[searches.array subarrayWithRange:NSMakeRange(0,MIN((NSUInteger)3,searches.count))];
     NSString* yearText = TO_NSSTRING(release->year) ?: @"";
     NSRegularExpression* yearPattern = [NSRegularExpression regularExpressionWithPattern:@"^[12][0-9]{3}$" options:0 error:NULL];
     NSInteger year = [yearPattern firstMatchInString:yearText options:0 range:NSMakeRange(0, yearText.length)] ? yearText.integerValue : 0;
@@ -404,9 +547,51 @@ static NSString* PlaybackTime(double seconds) {
     if (!episode) { self.openingStatus = @"Не удалось однозначно определить номер серии. Можно указать привязку вручную."; return nil; }
     return @{@"mal": @(mal), @"offset": @(episode - self.source_position), @"automatic": @YES};
 }
+-(void)performOpeningRequest:(NSURLRequest*)request attempt:(NSUInteger)attempt generation:(NSUInteger)generation version:(NSUInteger)version completion:(void(^)(NSData*,NSURLResponse*,NSError*))completion {
+    if (generation!=self.generation || version!=self.openingRequestVersion) return;
+    if (![[[self settings] getSettingsObjectAtKey:@"aniskip_auto_lookup"] boolValue]) { self.openingStatus=@"Сетевые запросы AniSkip отключены в настройках."; return; }
+    double remaining=self.openingDeadline-NSProcessInfo.processInfo.systemUptime;
+    if (remaining<=0) {
+        completion(nil,nil,[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorTimedOut userInfo:@{NSLocalizedDescriptionKey:@"Лимит автопоиска 45 секунд исчерпан. Можно повторить в меню Опенинг."}]); return;
+    }
+    if ([request.URL.host isEqualToString:@"api.jikan.moe"]) self.lastJikanRequest=NSProcessInfo.processInfo.systemUptime;
+    NSMutableURLRequest* limited=[request mutableCopy]; limited.timeoutInterval=MIN(request.timeoutInterval,remaining);
+    __weak PlayerController* weakSelf=self;
+    self.openingRequest=[NSURLSession.sharedSession dataTaskWithRequest:limited completionHandler:^(NSData* data,NSURLResponse* response,NSError* error) {
+        dispatch_async(dispatch_get_main_queue(),^{
+            PlayerController* owner=weakSelf;
+            if (!owner || generation!=owner.generation || version!=owner.openingRequestVersion) return;
+            owner.openingRequest=nil;
+            NSInteger status=[response isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse*)response).statusCode : 0;
+            BOOL transient=playback::retryOpeningRequest((int)status, error.code, error && [error.domain isEqualToString:NSURLErrorDomain], attempt);
+            if (transient) {
+                NSTimeInterval delay=(attempt+1)*1.5;
+                if ([response isKindOfClass:NSHTTPURLResponse.class]) {
+                    NSString* header=[((NSHTTPURLResponse*)response) valueForHTTPHeaderField:@"Retry-After"];
+                    if (header.doubleValue>0) delay=MIN(8,MAX(delay,header.doubleValue));
+                }
+                if (NSProcessInfo.processInfo.systemUptime+delay>=owner.openingDeadline) { completion(data,response,error); return; }
+                owner.openingStatus=[NSString stringWithFormat:@"Сервис занят/соединение прервано. Повтор %lu/2…",(unsigned long)attempt+1];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(delay*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
+                    [weakSelf performOpeningRequest:request attempt:attempt+1 generation:generation version:version completion:completion];
+                });
+                return;
+            }
+            completion(data,response,error);
+        });
+    }];
+    [self.openingRequest resume];
+}
+-(BOOL)advanceOpeningQuery:(NSDictionary*)metadata generation:(NSUInteger)generation version:(NSUInteger)version {
+    if (generation!=self.generation || version!=self.openingRequestVersion || self.mappingQueryIndex+1>=self.mappingQueries.count) return NO;
+    self.mappingQueryIndex+=1;
+    [self requestAnimePage:1 metadata:metadata candidates:@[] generation:generation version:version]; return YES;
+}
+
 -(void)resolveAutomaticOpening {
     if (![[[self settings] getSettingsObjectAtKey:@"aniskip_auto_lookup"] boolValue] || self.mappingAttempted) return;
     self.mappingAttempted = YES;
+    if (self.openingDeadline<=0) self.openingDeadline=NSProcessInfo.processInfo.systemUptime+45;
     NSDictionary* metadata = [self currentReleaseMetadata];
     if (!metadata) {
         NSUInteger generation = self.generation;
@@ -429,6 +614,7 @@ static NSString* PlaybackTime(double seconds) {
         (![metadata[@"category"] intValue] && (![metadata[@"year"] intValue] || ![metadata[@"episodes"] intValue]))) {
         self.openingStatus = @"Недостаточно данных каталога для безопасного поиска сезона; можно указать MAL ID вручную."; return;
     }
+    self.mappingQueries=self.releaseSearchQueries[@(static_cast<int64_t>(self.release_id))] ?: @[metadata[@"query"]]; self.mappingQueryIndex=0;
     ++self.openingRequestVersion; [self.openingRequest cancel];
     [self requestAnimePage:1 metadata:metadata candidates:@[] generation:self.generation version:self.openingRequestVersion];
 }
@@ -443,12 +629,13 @@ static NSString* PlaybackTime(double seconds) {
         }); return;
     }
     self.lastJikanRequest = NSProcessInfo.processInfo.systemUptime;
-    self.openingStatus = @"Автоматический поиск сезона в MyAnimeList через Jikan…";
+    NSString* search=self.mappingQueryIndex<self.mappingQueries.count ? self.mappingQueries[self.mappingQueryIndex] : metadata[@"query"];
+    self.openingStatus=[NSString stringWithFormat:@"Поиск сезона: %@ (%lu/%lu)…",search,(unsigned long)self.mappingQueryIndex+1,(unsigned long)MAX((NSUInteger)1,self.mappingQueries.count)];
     NSURLComponents* components = [NSURLComponents componentsWithString:@"https://api.jikan.moe/v4/anime"];
-    components.queryItems = @[[NSURLQueryItem queryItemWithName:@"q" value:metadata[@"query"]], [NSURLQueryItem queryItemWithName:@"limit" value:@"25"], [NSURLQueryItem queryItemWithName:@"page" value:[@(page) stringValue]]];
+    components.queryItems = @[[NSURLQueryItem queryItemWithName:@"q" value:search], [NSURLQueryItem queryItemWithName:@"limit" value:@"25"], [NSURLQueryItem queryItemWithName:@"page" value:[@(page) stringValue]]];
     NSURLRequest* request = [NSURLRequest requestWithURL:components.URL cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:20];
     __weak PlayerController* weakSelf = self;
-    self.openingRequest = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+    [self performOpeningRequest:request attempt:0 generation:generation version:version completion:^(NSData* data, NSURLResponse* response, NSError* error) {
         id json = nil;
         if (!error && [response isKindOfClass:NSHTTPURLResponse.class] && ((NSHTTPURLResponse*)response).statusCode == 200 && data.length && data.length <= 2 * 1024 * 1024)
             json = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
@@ -459,11 +646,14 @@ static NSString* PlaybackTime(double seconds) {
             if (![[[owner settings] getSettingsObjectAtKey:@"aniskip_auto_lookup"] boolValue]) return;
             if (![json isKindOfClass:NSDictionary.class] || ![json[@"data"] isKindOfClass:NSArray.class] || ![json[@"pagination"] isKindOfClass:NSDictionary.class] ||
                 ![json[@"pagination"][@"has_next_page"] isKindOfClass:NSNumber.class]) {
-                owner.openingStatus = @"База MyAnimeList недоступна или ограничила запросы. Просмотр продолжается без автопропуска."; return;
+                owner.openingStatus=error ? [NSString stringWithFormat:@"Поиск MAL: %@",error.localizedDescription] : @"База MyAnimeList недоступна или ограничила запросы. Просмотр продолжается без автопропуска."; return;
             }
             NSMutableArray* all = [candidates mutableCopy]; [all addObjectsFromArray:json[@"data"]];
             if ([json[@"pagination"][@"has_next_page"] boolValue]) {
-                if (page >= 3) { owner.openingStatus = @"Слишком широкий поиск сезона; автоматическая привязка не выбрана."; return; }
+                if (page >= 3) {
+                    if ([owner advanceOpeningQuery:metadata generation:generation version:version]) return;
+                    owner.openingStatus=@"Слишком широкий поиск по доступным названиям. Нужна ручная привязка MAL."; return;
+                }
                 [owner requestAnimePage:page + 1 metadata:metadata candidates:all generation:generation version:version]; return;
             }
             playback::AnimeIdentity source;
@@ -474,8 +664,8 @@ static NSString* PlaybackTime(double seconds) {
             for (id value in all) {
                 if (![value isKindOfClass:NSDictionary.class]) continue;
                 NSDictionary* row = value;
-                if (!PlaybackPositiveInteger(row[@"mal_id"], 1000000000) || !PlaybackPositiveInteger(row[@"episodes"], 1000000) || ![row[@"type"] isKindOfClass:NSString.class] || ![row[@"titles"] isKindOfClass:NSArray.class]) continue;
-                playback::AnimeIdentity candidate; candidate.mal = [row[@"mal_id"] longValue]; candidate.episodes = [row[@"episodes"] intValue];
+                if (!PlaybackPositiveInteger(row[@"mal_id"], 1000000000) || ![row[@"type"] isKindOfClass:NSString.class] || ![row[@"titles"] isKindOfClass:NSArray.class]) continue;
+                playback::AnimeIdentity candidate; candidate.ongoing=[row[@"status"] isEqual:@"Currently Airing"]; candidate.mal = [row[@"mal_id"] longValue]; candidate.episodes = PlaybackPositiveInteger(row[@"episodes"],1000000) ? [row[@"episodes"] intValue] : 0;
                 candidate.year = PlaybackPositiveInteger(row[@"year"], 9999) ? [row[@"year"] intValue] : 0;
                 // Jikan's year is null for many OVA/ONA entries. aired.from is the premiere year.
                 if (!candidate.year && [row[@"aired"] isKindOfClass:NSDictionary.class] && [row[@"aired"][@"from"] isKindOfClass:NSString.class]) {
@@ -491,8 +681,13 @@ static NSString* PlaybackTime(double seconds) {
                 matches.push_back(candidate);
             }
             long mal = playback::uniqueAnime(source, matches, true);
-            for (const auto& candidate : matches) if (candidate.mal == mal) total = candidate.episodes;
-            if (!mal || total <= 0) { owner.openingStatus = @"Сезон не найден однозначно по названию, году, формату и числу серий. Случайный результат не используется."; return; }
+            for (const auto& candidate : matches) if (candidate.mal == mal) total = candidate.episodes>0 ? candidate.episodes : 1000000;
+            if (!mal || total<=0) {
+                std::set<long> matchingIDs;
+                for (const auto& candidate:matches) if (playback::matchingAnime(source,candidate)) matchingIDs.insert(candidate.mal);
+                if (matchingIDs.empty() && [owner advanceOpeningQuery:metadata generation:generation version:version]) return;
+                owner.openingStatus=matchingIDs.size()>1 ? @"Найдено несколько сезонов с совпадающими данными. Нужна ручная привязка MAL." : @"Сезон не найден по доступным названиям и данным каталога. Нужна ручная привязка MAL."; return;
+            }
             NSMutableDictionary* cache = [[[NSUserDefaults standardUserDefaults] dictionaryForKey:@"aniskip_mal_cache_v4"] mutableCopy] ?: [NSMutableDictionary new];
             NSString* key = [NSString stringWithFormat:@"%lld", (long long)static_cast<int64_t>(owner.release_id)];
             // Bounded positive cache; failures are not persisted.
@@ -502,7 +697,6 @@ static NSString* PlaybackTime(double seconds) {
             if ([owner automaticOpeningBinding]) [owner fetchOpeningCandidate];
         });
     }];
-    [self.openingRequest resume];
 }
 
 -(NSNumber*)nextPosition {
@@ -593,7 +787,7 @@ static NSString* PlaybackTime(double seconds) {
 -(void)prepareController {
     if (self.player_view_controller) return;
     self.player_view_controller = [PlayerViewController new];
-    self.player_view_controller.nativePlayer.delegate = self;
+
     self.player_view_controller.modalPresentationStyle = UIModalPresentationFullScreen;
     self.player_view_controller.nativePlayer.videoGravity = AVLayerVideoGravityResizeAspect;
     self.player_view_controller.nativePlayer.showsPlaybackControls = NO;
@@ -605,7 +799,7 @@ static NSString* PlaybackTime(double seconds) {
         if (!owner || owner.player_view_controller != weakController) return;
         owner.generation += 1;
         [owner stopObserving];
-        owner.player_view_controller.nativePlayer.player = nil;
+        [owner.player_view_controller tearDownPlayback];
         owner.player_view_controller = nil;
     };
     self.player_view_controller.onSeek = ^{ PlayerController* owner = weakSelf; if (owner) owner->_watchSampler.reset(); };
@@ -616,7 +810,7 @@ static NSString* PlaybackTime(double seconds) {
 -(void)playWithReleaseID:(anixart::ReleaseID)release_id sourceID:(anixart::EpisodeSourceID)source_id position:(long)position autoShow:(BOOL)auto_show completion:(void(^)(BOOL))completion {
     [self stopObserving];
     self.release_id = release_id; self.source_id = source_id; self.source_position = position;
-    self.targetURL = nil; self.mappingAttempted = NO;
+    self.targetURL = nil; self.mappingAttempted = NO; self.openingDeadline=0;
     self.progressKey = [NSString stringWithFormat:@"%lld:%lld:%lld:%ld", (long long)static_cast<int64_t>([[AppDataController sharedInstance] getMyProfileID]), (long long)static_cast<int64_t>(release_id), (long long)static_cast<int64_t>(source_id), position];
     self.advancing = NO; self.openingHandled = NO; self.episodeCompleted = NO; self.errorShown = NO;
     self.pendingOpeningStart = -1; self.previewingOpening = NO; self.openingCandidate = nil; self.openingStatus = @"";
@@ -626,14 +820,13 @@ static NSString* PlaybackTime(double seconds) {
     [self.player_view_controller setSkipAvailable:NO nextAvailable:NO];
     if (auto_show) [self showViewController:self.player_view_controller];
     NSString* quality = [[self settings] getPrefferedQuality] ?: @"720";
-    BOOL web = [[self settings] getDefaultPlayer] == app_settings::Playback::DefaultPlayer::Web;
+    // Web playback was removed. Legacy saved preferences cannot bypass the native player.
     __block NSURL* target = nil;
     __block NSURL* stream = nil;
     [[LibanixartApi sharedInstance] asyncCall:^BOOL(anixart::Api* api) {
         auto episode = api->episodes().get_episode_target(release_id, source_id, (int32_t)position);
         target = [NSURL URLWithString:TO_NSSTRING(episode->url)];
         if (!target || ![@[@"https", @"http"] containsObject:target.scheme.lowercaseString]) return YES;
-        if (web) return NO;
         NSString* extension = target.pathExtension.lowercaseString;
         if ([@[@"m3u8", @"mp4", @"m4v"] containsObject:extension]) stream = target;
         else {
@@ -645,9 +838,6 @@ static NSString* PlaybackTime(double seconds) {
     } completion:^(BOOL errored) {
         if (generation != self.generation) { if (completion) completion(YES); return; }
         self.targetURL = target;
-        if (web && !errored) {
-            [self openWebPlayer]; if (completion) completion(NO); return;
-        }
         if (errored) { if (completion) completion(YES); [self showPlaybackError]; return; }
         self.selected_stream_url = stream;
         [self runPlayer];
@@ -674,7 +864,7 @@ static NSString* PlaybackTime(double seconds) {
     [player replaceCurrentItemWithPlayerItem:item];
     self.observedPlayer = player;
     self.observedItem = item;
-    self.player_view_controller.nativePlayer.player = self.observedPlayer;
+    [self.player_view_controller attachPlayer:self.observedPlayer];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(episodeEnded:) name:AVPlayerItemDidPlayToEndTimeNotification object:item];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(playbackFailed:) name:AVPlayerItemFailedToPlayToEndTimeNotification object:item];
     [item addObserver:self forKeyPath:@"status" options:NSKeyValueObservingOptionInitial | NSKeyValueObservingOptionNew context:PlaybackStatusContext];
@@ -705,7 +895,7 @@ static NSString* PlaybackTime(double seconds) {
                 [owner updatePlaybackAt:CMTimeGetSeconds(owner.observedPlayer.currentTime)];
                 if (generation != owner.generation) return;
                 [owner installOpeningBoundaries];
-                [owner.observedPlayer play];
+                owner.observedPlayer.rate=owner.player_view_controller.preferredRate;
                 NSDictionary* savedOpening = [owner openingRecord];
                 if (!savedOpening) [owner fetchOpeningCandidate];
                 else owner.openingStatus = [NSString stringWithFormat:@"Границы сохранены: %@–%@ (%@).", PlaybackTime([savedOpening[@"start"] doubleValue]), PlaybackTime([savedOpening[@"end"] doubleValue]), savedOpening[@"origin"] ?: @"локально"];
@@ -824,7 +1014,7 @@ static NSString* PlaybackTime(double seconds) {
         self.pendingOpeningStart = seconds; self.previewingOpening = YES;
         self.openingStatus = [NSString stringWithFormat:@"Начало %@. Дойди до конца опенинга и отметь конец.", PlaybackTime(seconds)];
         [self updatePlaybackAt:seconds];
-        [self.observedPlayer play];
+        self.observedPlayer.rate=self.player_view_controller.preferredRate;
     }]];
     if (self.pendingOpeningStart >= 0) {
         [menu addAction:[UIAlertAction actionWithTitle:@"Конец опенинга сейчас — сохранить" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
@@ -843,7 +1033,7 @@ static NSString* PlaybackTime(double seconds) {
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Повторить автопоиск / запрос AniSkip" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
         if (generation != self.generation) return;
-        self.mappingAttempted = NO; [self fetchOpeningCandidate];
+        self.mappingAttempted = NO; self.openingDeadline=0; [self fetchOpeningCandidate];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"MAL ID вручную (необязательно)" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
         if (generation != self.generation) return; [self configureOpeningBinding]; }]];
@@ -858,7 +1048,7 @@ static NSString* PlaybackTime(double seconds) {
     [menu addAction:[UIAlertAction actionWithTitle:@"Вписать видео" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
         if (generation != self.generation) return; [self.player_view_controller fitVideo]; }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Продолжить просмотр" style:UIAlertActionStyleCancel handler:^(UIAlertAction* action) {
-        if (generation == self.generation) [self.observedPlayer play];
+        if (generation == self.generation) self.observedPlayer.rate=self.player_view_controller.preferredRate;
     }]];
     [self presentOpeningAlert:menu];
 }
@@ -886,6 +1076,7 @@ static NSString* PlaybackTime(double seconds) {
     [self presentOpeningAlert:editor];
 }
 -(void)invalidateFetchedOpenings {
+    self.openingDeadline=0;
     NSString* prefix = [[self openingBindingKey] stringByAppendingString:@":"];
     if (!prefix.length) return;
     NSMutableDictionary* records = [[[NSUserDefaults standardUserDefaults] dictionaryForKey:@"episode_openings_v3"] mutableCopy];
@@ -939,6 +1130,7 @@ static NSString* PlaybackTime(double seconds) {
     NSDictionary* binding = [self openingBinding];
     double duration = CMTimeGetSeconds(self.observedItem.duration);
     if (!self.ready || !self.progressKey || !std::isfinite(duration) || duration <= 0) return;
+    if (self.openingDeadline<=0) self.openingDeadline=NSProcessInfo.processInfo.systemUptime+45;
     if (!binding) { [self resolveAutomaticOpening]; return; }
     if (![[[self settings] getSettingsObjectAtKey:@"aniskip_auto_lookup"] boolValue]) { self.openingStatus = @"Сетевые запросы AniSkip отключены в настройках."; return; }
     long episode = self.source_position + [binding[@"offset"] longValue];
@@ -947,19 +1139,20 @@ static NSString* PlaybackTime(double seconds) {
     NSUInteger requestVersion = self.openingRequestVersion, generation = self.generation;
     NSURLComponents* components = [NSURLComponents componentsWithString:@"https://api.aniskip.com"];
     components.path = [NSString stringWithFormat:@"/v2/skip-times/%lld/%ld", [binding[@"mal"] longLongValue], episode];
-    components.queryItems = @[[NSURLQueryItem queryItemWithName:@"types" value:@"op"], [NSURLQueryItem queryItemWithName:@"episodeLength" value:[NSString stringWithFormat:@"%lld", (long long)std::llround(duration)]]];
+    components.queryItems = @[[NSURLQueryItem queryItemWithName:@"types" value:@"op"], [NSURLQueryItem queryItemWithName:@"episodeLength" value:@"0"]];
     NSURLRequest* request = [NSURLRequest requestWithURL:components.URL cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:15];
     self.openingStatus = @"Запрашиваются таймкоды AniSkip…";
     __weak PlayerController* weakSelf = self;
-    self.openingRequest = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+    [self performOpeningRequest:request attempt:0 generation:generation version:requestVersion completion:^(NSData* data, NSURLResponse* response, NSError* error) {
         NSDictionary* candidate = nil;
         NSMutableArray<NSDictionary*>* needsReview = [NSMutableArray new];
-        NSString* reason = @"Сервис недоступен или вернул некорректный ответ.";
-        if ([response isKindOfClass:NSHTTPURLResponse.class]) reason = [NSString stringWithFormat:@"AniSkip: HTTP %ld.", (long)((NSHTTPURLResponse*)response).statusCode];
+        NSString* reason = error ? [NSString stringWithFormat:@"AniSkip: %@",error.localizedDescription] : @"Сервис недоступен или вернул некорректный ответ.";
+        if (!error && [response isKindOfClass:NSHTTPURLResponse.class]) reason = [NSString stringWithFormat:@"AniSkip: HTTP %ld.", (long)((NSHTTPURLResponse*)response).statusCode];
         if (!error && [response isKindOfClass:NSHTTPURLResponse.class] && ((NSHTTPURLResponse*)response).statusCode == 200 && data.length && data.length <= 1024 * 1024) {
             id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
             if ([json isKindOfClass:NSDictionary.class] && [json[@"results"] isKindOfClass:NSArray.class]) {
                 NSMutableArray<NSDictionary*>* compatible = [NSMutableArray new];
+                NSMutableSet<NSString*>* reported=[NSMutableSet new];
                 reason = [NSString stringWithFormat:@"AniSkip: для MAL %@, серии %ld нет op-разметки.", binding[@"mal"], episode];
                 for (id value in json[@"results"]) {
                     if (![value isKindOfClass:NSDictionary.class]) continue;
@@ -968,11 +1161,14 @@ static NSString* PlaybackTime(double seconds) {
                         !PlaybackRealNumber(interval[@"endTime"]) || !PlaybackRealNumber(row[@"episodeLength"])) continue;
                     double begin = [interval[@"startTime"] doubleValue], end = [interval[@"endTime"] doubleValue], reference = [row[@"episodeLength"] doubleValue];
                     if (!std::isfinite(reference) || !playback::validOpeningInterval(begin, end, duration)) { reason = @"AniSkip вернул некорректные границы опенинга."; continue; }
+                    NSString* identity=[NSString stringWithFormat:@"%.6f:%.6f:%.6f",begin,end,reference];
+                    if ([reported containsObject:identity]) continue; [reported addObject:identity];
                     if (std::abs(reference - duration) > 1.0) {
                         reason = [NSString stringWithFormat:@"Версия видео отличается: плеер %.3f с, AniSkip %.3f с (разница %.3f с). Автопропуск не применён.", duration, reference, std::abs(reference - duration)];
                         [needsReview addObject:@{@"start": @(begin), @"end": @(end), @"duration": @(duration), @"reference": @(reference), @"requiresReview": @YES}]; continue;
                     }
-                    [compatible addObject:@{@"start": @(begin), @"end": @(end), @"duration": @(duration)}];
+                    NSDictionary* intervalRecord=@{@"start":@(begin),@"end":@(end),@"duration":@(duration)};
+                    if (![compatible containsObject:intervalRecord]) [compatible addObject:intervalRecord];
                 }
                 if (compatible.count == 1) candidate = compatible.firstObject;
                 else if (!compatible.count && needsReview.count == 1) candidate = needsReview.firstObject;
@@ -999,7 +1195,6 @@ static NSString* PlaybackTime(double seconds) {
             [owner updatePlaybackAt:CMTimeGetSeconds(owner.observedPlayer.currentTime)];
         });
     }];
-    [self.openingRequest resume];
 }
 -(void)reviewOpeningCandidate {
     NSUInteger generation = self.generation;
@@ -1068,8 +1263,6 @@ static NSString* PlaybackTime(double seconds) {
 -(void)updatePlaybackAt:(double)seconds {
     if (!self.ready || self.resumePending || !std::isfinite(seconds)) return;
     BOOL hasNext = [self nextPosition] != nil;
-    NSString* openingTitle = self.pendingOpeningStart >= 0 ? @"Конец опенинга" : (self.openingCandidate ? @"Проверить опенинг" : @"Опенинг");
-    [self.player_view_controller.openingButton setTitle:openingTitle forState:UIControlStateNormal];
     double target = [self openingTargetAt:seconds];
     [self.player_view_controller setSkipAvailable:target >= 0 nextAvailable:hasNext];
     BOOL playing = self.observedPlayer.rate > 0;
@@ -1116,44 +1309,16 @@ static NSString* PlaybackTime(double seconds) {
     [self.player_view_controller setLoading:NO];
     if (self.errorShown || !self.player_view_controller || self.player_view_controller.presentedViewController) return;
     self.errorShown = YES;
-    UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"Не удалось воспроизвести видео" message:@"Источник не вернул совместимый поток. Можно попробовать веб-плеер источника или другую озвучку." preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"Не удалось воспроизвести видео" message:@"Источник не вернул совместимый поток. Повтори попытку или выбери другой источник/озвучку." preferredStyle:UIAlertControllerStyleAlert];
     if (self.progressKey) [alert addAction:[UIAlertAction actionWithTitle:@"Повторить" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
         [self playWithReleaseID:self.release_id sourceID:self.source_id position:self.source_position autoShow:NO completion:nil];
     }]];
-    if (self.targetURL) [alert addAction:[UIAlertAction actionWithTitle:@"Открыть веб-плеер" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) { [self openWebPlayer]; }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Закрыть" style:UIAlertActionStyleCancel handler:^(UIAlertAction* action) { [self.player_view_controller dismissViewControllerAnimated:YES completion:nil]; }]];
     [self.player_view_controller presentViewController:alert animated:YES completion:nil];
-}
--(void)openWebPlayer {
-    if (!self.targetURL) return;
-    NSURL* url = self.targetURL;
-    ++self.generation; [self stopObserving];
-    SFSafariViewController* web = [[SFSafariViewController alloc] initWithURL:url];
-    UIViewController* native = self.player_view_controller;
-    self.player_view_controller = nil;
-    if (native.presentingViewController) [native dismissViewControllerAnimated:YES completion:^{ [self showViewController:web]; }];
-    else [self showViewController:web];
 }
 -(AVPlayerViewController*)getPlayer { return self.player_view_controller.nativePlayer; }
 +(instancetype)sharedInstance {
     static PlayerController* shared; static dispatch_once_t once;
     dispatch_once(&once, ^{ shared = [PlayerController new]; }); return shared;
-}
-// PiP state belongs to the delegate lifecycle, not to a nonexistent AVKit property.
--(void)playerViewControllerWillStartPictureInPicture:(AVPlayerViewController*)controller { if (controller == self.player_view_controller.nativePlayer) self.player_view_controller.pipActive = YES; }
--(void)playerViewControllerDidStopPictureInPicture:(AVPlayerViewController*)controller {
-    if (controller != self.player_view_controller.nativePlayer) return;
-    self.player_view_controller.pipActive = NO;
-    if (!self.player_view_controller.presentingViewController) {
-        ++self.generation; [self stopObserving]; self.player_view_controller = nil;
-    }
-}
--(void)playerViewController:(AVPlayerViewController*)controller failedToStartPictureInPictureWithError:(NSError*)error { if (controller == self.player_view_controller.nativePlayer) self.player_view_controller.pipActive = NO; }
--(void)playerViewController:(AVPlayerViewController*)controller restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL))completion {
-    PlayerViewController* container = self.player_view_controller;
-    if (!container || container.nativePlayer != controller) { completion(NO); return; }
-    if (container.presentingViewController) { completion(YES); return; }
-    [self showViewController:container];
-    completion(container.presentingViewController != nil);
 }
 @end

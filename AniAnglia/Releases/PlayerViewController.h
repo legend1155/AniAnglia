@@ -9,7 +9,7 @@
 #import <AVKit/AVKit.h>
 #import "LibanixartApi.h"
 
-@interface PlayerController : NSObject <AVPictureInPictureControllerDelegate, AVPlayerViewControllerDelegate>
+@interface PlayerController : NSObject
 @property(nonatomic, readonly, retain, getter = getPlayer) AVPlayerViewController* player;
 
 -(instancetype)init;

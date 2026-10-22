@@ -9,6 +9,7 @@ struct AnimeIdentity {
     long mal = 0;
     std::vector<std::string> titles;
     int year = 0, episodes = 0, category = 0;
+    bool ongoing = false;
 };
 inline bool matchingAnime(const AnimeIdentity& source, const AnimeIdentity& candidate) {
     if (candidate.mal <= 0 || candidate.mal > 1000000000 || candidate.category <= 0 || candidate.category > 3) return false;
@@ -16,7 +17,9 @@ inline bool matchingAnime(const AnimeIdentity& source, const AnimeIdentity& cand
     if (!source.category && (source.year <= 0 || source.episodes <= 0)) return false;
     if (source.year <= 0 && source.episodes <= 0) return false;
     if (source.year > 0 && source.year != candidate.year) return false;
-    if (source.episodes > 0 && source.episodes != candidate.episodes) return false;
+    if (source.episodes > 0 && candidate.episodes > 0 && source.episodes != candidate.episodes) return false;
+    // An ongoing season can have a null MAL episode count. Exact title + year + format still required.
+    if (candidate.episodes <= 0 && (!candidate.ongoing || source.year <= 0 || source.category <= 0 || candidate.year <= 0)) return false;
     for (const auto& title : source.titles) {
         if (title.size() >= 3 && std::find(candidate.titles.begin(), candidate.titles.end(), title) != candidate.titles.end()) return true;
     }

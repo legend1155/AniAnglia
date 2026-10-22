@@ -116,8 +116,10 @@
 
 // -- playback
 -(app_settings::Playback::DefaultPlayer)getDefaultPlayer {
-    NSNumber* default_player = [self getSettingsObjectAtKey:app_settings::Playback::default_player];
-    return static_cast<app_settings::Playback::DefaultPlayer>([default_player longValue]);
+    // Migrate the retired web/unspecified preference; playback is native-only.
+    if ([[self getSettingsObjectAtKey:app_settings::Playback::default_player] integerValue] != 1)
+        [self setSettingsObject:@1 atKey:app_settings::Playback::default_player];
+    return app_settings::Playback::DefaultPlayer::Internal;
 }
 -(void)setDefaultPlayer:(app_settings::Playback::DefaultPlayer)default_player {
     [self setSettingsObject:@(static_cast<int>(default_player)) atKey:app_settings::Playback::default_player];

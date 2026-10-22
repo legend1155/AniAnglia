@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory() as temp:
 player = (root/'AniAnglia/Releases/PlayerViewController.mm').read_text()
 assert '.pictureInPictureActive' not in player, 'Regression: property does not exist on AVPlayerViewController'
 assert '@interface PlayerViewController : UIViewController' in player
-assert 'playerViewControllerWillStartPictureInPicture:' in player
+assert 'pictureInPictureControllerWillStartPictureInPicture:' in player
 assert 'failedToStartPictureInPictureWithError:' in player
 assert '[self.view addSubview:control]' in player
 assert 'playback::confirmedOpeningTarget' in player and 'playback::nextPosition' in player
@@ -112,9 +112,9 @@ print('PASS: source regression checks; iOS compilation and device UI still requi
 assert 'controlsButton' not in player, 'No permanent floating eye button'
 assert 'showsPlaybackControls = YES' not in player
 assert 'self.closeButton, self.actionStack, self.transportStack, self.playbackStatusLabel' in player
-assert 'view.hidden = hidden' in player and 'tap.cancelsTouchesInView = NO' in player
+assert 'view.hidden = hidden' in player and 'tap.cancelsTouchesInView=NO' in player
 assert 'discovery::controlsShouldHide' in player and 'UIAccessibilityIsVoiceOverRunning()' in player
-assert 'UIBlurEffectStyleSystemUltraThinMaterialDark' in player
+assert 'UIBlurEffectStyleSystemUltraThinMaterialDark' in (root/'AniAnglia/Releases/PlayerChrome.h').read_text()
 assert '[current sampleWatchAt:seconds]' in player and '[current.player_view_controller refreshTransport]' in player
 assert 'AVPlayerTimeControlStatusPlaying' in player and '_watchSampler.reset()' in player
 assert 'AniWatchKey(parts[0].longLongValue)' in player and 'watch_interest_v1_' in (root/'AniAnglia/Main/WatchHistory.h').read_text()
@@ -131,3 +131,36 @@ assert 'AniWatchRanges(seconds)' in watch_storage and 'entries.count > 300' in w
 assert 'episodes.count > 50' in watch_storage and 'library.count > 100' in watch_storage
 assert 'AniWatchSeconds(record, duration)' in home
 print('PASS: compressed coverage storage and retention limits source checks.')
+
+chrome=(root/'AniAnglia/Releases/PlayerChrome.h').read_text()
+assert '[self sendSubviewToBack:self.glass]' in chrome
+assert '[self bringSubviewToFront:self.glyph]' in chrome
+assert 'chromeStyle==1' in chrome and 'AniPlayerIcon' in chrome
+assert 'playback::chromeLayout' in player and 'UIStackViewDistributionEqualSpacing' not in player
+assert 'episodeLength" value:@"0"' in player and 'advanceOpeningQuery' in player
+network=player[player.index('-(void)performOpeningRequest:',player.index('@implementation PlayerController')):player.index('-(BOOL)advanceOpeningQuery:',player.index('@implementation PlayerController'))]
+assert '[self.openingRequest resume];' in network, 'A constructed URLSession task must actually be started'
+assert 'retryOpeningRequest' in network and 'openingDeadline' in network and 'limited.timeoutInterval' in network
+print('PASS: v5.3 foreground layers, compact layout, started network tasks and bounded retry source checks.')
+
+assert '@interface AniPlayerSlider : UIControl' in chrome and 'CGRectMake(x-4.5,y-4.5,9,9)' in chrome
+assert 'serial!=owner.seekSerial || item!=owner.nativePlayer.player.currentItem' in player
+assert 'player.rate=owner.preferredRate' in player
+print('PASS: fixed-size custom thumb and stale-seek completion guards source checks.')
+
+# v5.4: native-only, actual visible PiP source and compact grouped chrome.
+assert 'openingButton' not in player and 'openWebPlayer' not in player and 'SFSafariViewController' not in player
+assert 'AVPictureInPictureController alloc] initWithPlayerLayer:self.videoSurface.playerLayer' in player
+assert 'self.videoSurface.playerLayer.player=player' in player
+assert '[self.pipController startPictureInPicture]' in player and 'isPictureInPicturePossible' in player
+assert 'self.pipController.delegate=nil' in player and 'restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:' in player
+assert 'self.restoringPiP=YES' in player and 'completion(YES)' in player
+assert 'controlPanel' not in player and 'layout.more' in player
+assert 'visible.size.height<400' not in player
+assert 'UIImageSymbolWeightBold' in chrome and 'self.chromeStyle==2 ? 16 : 14' in chrome
+source=(root/'AniAnglia/Releases/SourceSelectViewController.mm').read_text()
+assert 'retiredPlayerSource(source->name)' in source and 'preferred_source_name' in source
+assert 'UIBackgroundModes' in (root/'AniAnglia/Info.plist').read_text()
+assert 'AVAudioSessionCategoryPlayback' in player
+assert 'Веб-плеер источника' not in (root/'AniAnglia/Main/Settings/SettingsViewController.mm').read_text()
+print('PASS: v5.4 native-only UI and visible-layer PiP wiring (static, not device verification).')

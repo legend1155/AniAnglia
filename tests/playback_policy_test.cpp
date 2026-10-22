@@ -1,5 +1,6 @@
 #include "PlaybackPolicy.hpp"
 #include "AnimeMapping.hpp"
+#include "PlayerChromeLayout.hpp"
 #include "../AniAnglia/Main/DiscoveryPolicy.hpp"
 #include "../AniAnglia/Main/WatchPolicy.hpp"
 #include <cassert>
@@ -247,5 +248,45 @@ int main() {
             check(discovery::controlsShouldHide(hidden, playing, interacting, accessible, 5, 4) == (!hidden && playing && !interacting && !accessible));
     check(!discovery::controlsShouldHide(false, true, false, false, 3, 4));
     check(!discovery::controlsShouldHide(false, true, false, false, std::numeric_limits<double>::quiet_NaN(), 4));
+    // Ongoing entries with an unknown total require exact year and format in addition to title.
+    other=candidate; other.episodes=0; other.ongoing=true; check(matchingAnime(show,other));
+    unknown=show; unknown.year=0; check(!matchingAnime(unknown,other));
+    unknown=show; unknown.category=0; check(!matchingAnime(unknown,other));
+    other.ongoing=false; check(!matchingAnime(show,other));
+    for (int code : {429,500,502,503,504}) {
+        check(retryOpeningRequest(code,0,false,0)); check(!retryOpeningRequest(code,0,false,2));
+    }
+    for (int code : {200,400,401,403,404}) check(!retryOpeningRequest(code,0,false,0));
+    check(retryOpeningRequest(0,-1001,true,0));
+    check(retryOpeningRequest(0,-1005,true,1));
+    check(!retryOpeningRequest(0,-999,true,0));
+    check(!retryOpeningRequest(0,-1001,false,0));
+    check(retiredPlayerSource("Libria")); check(retiredPlayerSource("AniLibria player"));
+    check(retiredPlayerSource("LIBRIA")); check(retiredPlayerSource("Либрия"));
+    check(!retiredPlayerSource("Kodik")); check(!retiredPlayerSource("Sibnet"));
+    auto overlap=[](ChromeRect a,ChromeRect b) { return a.w>0 && a.h>0 && b.w>0 && b.h>0 && a.x<b.x+b.w-0.01 && b.x<a.x+a.w-0.01 && a.y<b.y+b.h-0.01 && b.y<a.y+a.h-0.01; };
+    for (auto size : std::vector<std::pair<int,int>>{{756,356},{724,320},{480,300},{358,740},{288,560},{390,219},{320,180},{288,162}}) {
+        for (bool skip : {false,true}) for (bool next : {false,true}) for (bool large : {false,true}) {
+            auto layout=chromeLayout(0,0,size.first,size.second,skip,next,large);
+            std::vector<ChromeRect> frames={layout.slider,layout.back,layout.play,layout.forward,layout.speed,layout.more,layout.time};
+            if (!layout.shortVideo) frames.push_back(layout.close);
+            if (skip) frames.push_back(layout.skip);
+            if (next) frames.push_back(layout.next);
+            bool fits=true,distinct=true;
+            for (std::size_t i=0;i<frames.size();++i) {
+                const auto& a=frames[i]; fits=fits && a.x>=0 && a.y>=0 && a.x+a.w<=size.first+0.01 && a.y+a.h<=size.second+0.01;
+                for (std::size_t j=i+1;j<frames.size();++j) distinct=distinct && !overlap(a,frames[j]);
+            }
+            check(fits); check(distinct);
+            check(layout.panel.w<=640 && layout.panel.x>=0 && layout.panel.y>=0 && layout.panel.y+layout.panel.h<=size.second);
+            bool inside=true;
+            for (const auto& a : frames) {
+                if (a.x==layout.close.x && a.y==layout.close.y && a.w==44 && a.h==44 && !layout.shortVideo) continue; // Close/status are intentionally above the panel.
+                inside=inside && a.x>=layout.panel.x && a.y>=layout.panel.y && a.x+a.w<=layout.panel.x+layout.panel.w && a.y+a.h<=layout.panel.y+layout.panel.h;
+            }
+            check(inside);
+            if (skip && next && layout.skip.y==layout.next.y) check(layout.next.x-(layout.skip.x+layout.skip.w)<=4.01);
+        }
+    }
     std::cout << "PASS: " << total << " playback/discovery checks (production C++ headers).\n";
 }

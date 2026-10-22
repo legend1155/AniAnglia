@@ -10,6 +10,7 @@
 #import "LibanixartApi.h"
 #import "AppColor.h"
 #import "StringCvt.h"
+#include "../../Releases/PlaybackPolicy.hpp"
 #import "SettingsProfileViewController.h"
 #import "CustomTableViewCells.h"
 #import "AppDataController.h"
@@ -34,6 +35,9 @@
         [self loadVoices];
     } else {
         self.names = [[[AppDataController sharedInstance] getSettingsController] getSettingsObjectAtKey:@"known_source_names"] ?: @[];
+        self.names=[self.names filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSString* name, NSDictionary* bindings) {
+            return !playback::retiredPlayerSource(TO_STDSTRING(name));
+        }]];
         self.filtered = self.names; [self.tableView reloadData];
     }
 }
@@ -94,7 +98,7 @@
 }
 -(void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self.tableView reloadData]; }
 -(NSString*)tableView:(UITableView*)tableView titleForFooterInSection:(NSInteger)section {
-    return self.cacheMode ? @"Кеш только изображений, с учётом HTTP-политики сервера. Видео для офлайн-просмотра не сохраняются." : @"Skip, прогресс и автоматические переходы работают во встроенном iOS-плеере. В веб-плеере ими управляет сайт. AniSkip автоматически ищет сезон через Jikan и применяет таймкоды подходящей серии и длительности видео. Без меток ничего не вырезается. Пропуск конца серии — отдельная настройка перехода до титров.";
+    return self.cacheMode ? @"Кеш только изображений, с учётом HTTP-политики сервера. Видео для офлайн-просмотра не сохраняются." : @"Skip, прогресс и автоматические переходы работают во встроенном iOS-плеере. AniSkip автоматически ищет сезон через Jikan и применяет таймкоды подходящей серии и длительности видео. Без меток ничего не вырезается. Пропуск конца серии — отдельная настройка перехода до титров.";
 }
 -(NSInteger)tableView:(UITableView*)tableView numberOfRowsInSection:(NSInteger)section { return self.cacheMode ? 2 : 12; }
 -(UITableViewCell*)tableView:(UITableView*)tableView cellForRowAtIndexPath:(NSIndexPath*)path {
@@ -113,10 +117,10 @@
         [toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
         cell.accessoryView = toggle;
     } else if (path.row == 7) {
-        cell.detailTextLabel.text = @"В плеере → Опенинг";
+        cell.detailTextLabel.text = @"В плеере → ⋯ → Метки";
     } else if (path.row < keys.count) {
         id value = [self.settings getSettingsObjectAtKey:keys[path.row]];
-        cell.detailTextLabel.text = path.row == 0 ? ([value integerValue] == 2 ? @"Веб" : @"iOS") : [value description];
+        cell.detailTextLabel.text = path.row == 0 ? @"Встроенный iOS" : [value description];
     }
     return cell;
 }
@@ -131,6 +135,7 @@
         [[NSURLCache sharedURLCache] removeAllCachedResponses];
         [tableView reloadData]; return;
     }
+    if (!self.cacheMode && path.row == 0) return; // Native-only, no retired web choice.
     if (!self.cacheMode && ((path.row >= 4 && path.row <= 6) || path.row == 8 || path.row == 9)) return;
     if (!self.cacheMode && (path.row == 2 || path.row == 3)) {
         PlaybackChoiceViewController* choices = [[PlaybackChoiceViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
@@ -139,7 +144,7 @@
         [self.navigationController pushViewController:choices animated:YES]; return;
     }
     if (!self.cacheMode && path.row == 7) {
-        UIAlertController* info = [UIAlertController alertControllerWithTitle:@"Точный пропуск опенинга" message:@"AniSkip и автопропуск включены по умолчанию. Во встроенном iOS-плеере приложение ищет сезон в MyAnimeList через Jikan по названию и данным релиза, затем запрашивает op-таймкоды AniSkip для номера и длительности серии. Ввод ID и подтверждение каждой серии не нужны. При неоднозначности, отсутствии разметки или несовпадении длительности пропуска нет. Ручная разметка/привязка остаётся в меню Опенинг. Распознавания звука/видео нет. Отключение сетевого автопоиска не удаляет уже сохранённые метки; чтобы не перематывать, выключи Автопропуск опенинга." preferredStyle:UIAlertControllerStyleAlert];
+        UIAlertController* info = [UIAlertController alertControllerWithTitle:@"Точный пропуск опенинга" message:@"AniSkip и автопропуск включены по умолчанию. Во встроенном iOS-плеере приложение ищет сезон в MyAnimeList через Jikan по названию и данным релиза, затем запрашивает op-таймкоды AniSkip для номера и длительности серии. Ввод ID и подтверждение каждой серии не нужны. При неоднозначности, отсутствии разметки или несовпадении длительности пропуска нет. Ручная разметка/привязка остаётся в меню ⋯ → Метки и диагностика автоскипа. Распознавания звука/видео нет. Отключение сетевого автопоиска не удаляет уже сохранённые метки; чтобы не перематывать, выключи Автопропуск опенинга." preferredStyle:UIAlertControllerStyleAlert];
         [info addAction:[UIAlertAction actionWithTitle:@"ОК" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:info animated:YES completion:nil]; return;
     }
@@ -150,11 +155,11 @@
         [self presentViewController:confirm animated:YES completion:nil]; return;
     }
     NSString* key = self.cacheMode ? @"max_cache_size" : (@[@"default_player", @"preffered_quality", @"preferred_type_name", @"preferred_source_name", @"", @"", @"", @"opening_start", @"default_skip_time", @"", @"ending_skip_time"])[path.row];
-    NSArray* values = self.cacheMode ? @[@0, @10, @50, @100, @250] : (path.row == 0 ? @[@1, @2] : (path.row == 1 ? @[@"360", @"480", @"720", @"1080"] : nil));
+    NSArray* values = self.cacheMode ? @[@0, @10, @50, @100, @250] : (path.row == 1 ? @[@"360", @"480", @"720", @"1080"] : nil);
     UIAlertController* alert = [UIAlertController alertControllerWithTitle:[tableView cellForRowAtIndexPath:path].textLabel.text message:nil preferredStyle:UIAlertControllerStyleAlert];
     if (values) {
         for (id value in values) {
-            NSString* title = (!self.cacheMode && path.row == 0) ? ([value integerValue] == 2 ? @"Веб-плеер источника" : @"Встроенный iOS") : [value description];
+            NSString* title = [value description];
             [alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
                 [self.settings setSettingsObject:self.cacheMode ? @([value integerValue]*1024*1024) : value atKey:key];
                 [tableView reloadData];
