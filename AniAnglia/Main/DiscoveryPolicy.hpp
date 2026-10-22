@@ -15,7 +15,7 @@ struct Candidate {
 using Taste = std::map<std::string, int>;
 inline void learn(Taste& taste, const std::vector<std::string>& genres, int weight) {
     std::set<std::string> distinct(genres.begin(), genres.end());
-    for (const auto& genre : distinct) if (!genre.empty()) taste[genre] = std::clamp(taste[genre] + weight, 0, 100);
+    for (const auto& genre : distinct) if (!genre.empty()) taste[genre] = std::clamp(taste[genre] + weight, -100, 100);
 }
 inline double score(const Candidate& item, const Taste& taste) {
     if (item.id <= 0 || item.seen || item.dropped || item.favorite || item.watching ||
@@ -25,7 +25,8 @@ inline double score(const Candidate& item, const Taste& taste) {
     for (const auto& genre : distinct) {
         auto found = taste.find(genre); if (found != taste.end()) affinity += found->second;
     }
-    return affinity * 10 + item.rating;
+    // A bounded mean allows negative preferences without treating them as invalid items.
+    return 1000.0 + affinity * 10 / std::max<std::size_t>(1, distinct.size()) + item.rating;
 }
 inline std::vector<long long> rank(const std::vector<Candidate>& items, const Taste& taste, std::size_t limit = 20) {
     std::vector<std::pair<double, long long>> scored;

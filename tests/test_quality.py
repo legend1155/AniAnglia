@@ -107,3 +107,27 @@ for label in ['4.5', 'OVA 4', '4 серия + спецвыпуск', 'Season 2 E
     assert not number_pattern.fullmatch(label), label
 print('PASS: v5 static source checks and recorded AniSkip response fixture (not iOS integration).')
 print('PASS: source regression checks; iOS compilation and device UI still require Xcode/iPhone.')
+
+# v5.2 control layer and actual-watch integration checks. These are not UIKit rendering tests.
+assert 'controlsButton' not in player, 'No permanent floating eye button'
+assert 'showsPlaybackControls = YES' not in player
+assert 'self.closeButton, self.actionStack, self.transportStack, self.playbackStatusLabel' in player
+assert 'view.hidden = hidden' in player and 'tap.cancelsTouchesInView = NO' in player
+assert 'discovery::controlsShouldHide' in player and 'UIAccessibilityIsVoiceOverRunning()' in player
+assert 'UIBlurEffectStyleSystemUltraThinMaterialDark' in player
+assert '[current sampleWatchAt:seconds]' in player and '[current.player_view_controller refreshTransport]' in player
+assert 'AVPlayerTimeControlStatusPlaying' in player and '_watchSampler.reset()' in player
+assert 'AniWatchKey(parts[0].longLongValue)' in player and 'watch_interest_v1_' in (root/'AniAnglia/Main/WatchHistory.h').read_text()
+assert '[self saveWatchHistory];' in player and 'beginWatchTracking' in player
+assert 'discovery::watchInterest(watched, duration)' in home
+assert 'Сбросить обучение по просмотру' in home and 'AniWatchHistoryReset' in home
+assert 'negative_genres' in home and 'watchRevision' in home
+watch_methods = player[player.index('-(void)beginWatchTracking {'):player.index('-(void)saveProgress {')]
+assert 'playback_progress' not in watch_methods, 'Resume offsets must not be treated as watched coverage'
+print('PASS: v5.2 watch integration, unified controls and glass source regression checks (not iOS SDK tests).')
+
+watch_storage = (root/'AniAnglia/Main/WatchHistory.h').read_text()
+assert 'AniWatchRanges(seconds)' in watch_storage and 'entries.count > 300' in watch_storage
+assert 'episodes.count > 50' in watch_storage and 'library.count > 100' in watch_storage
+assert 'AniWatchSeconds(record, duration)' in home
+print('PASS: compressed coverage storage and retention limits source checks.')

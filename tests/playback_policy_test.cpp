@@ -1,6 +1,7 @@
 #include "PlaybackPolicy.hpp"
 #include "AnimeMapping.hpp"
 #include "../AniAnglia/Main/DiscoveryPolicy.hpp"
+#include "../AniAnglia/Main/WatchPolicy.hpp"
 #include <cassert>
 #include <iostream>
 #include <limits>
@@ -181,5 +182,70 @@ int main() {
     check(!discovery::validYearRange(2024, 2023, 2026));
     check(!discovery::validYearRange(1899, 2023, 2026));
     check(!discovery::validYearRange(0, 2032, 2026));
+    // Actual coverage: a seek, pause, resume offset or loop is not new watch time.
+    using discovery::WatchSampler;
+    using discovery::watchInterest;
+    WatchSampler sampler;
+    std::set<int> coverage;
+    for (int frame = 0; frame <= 400; ++frame) {
+        auto values = sampler.sample(frame * 0.25, frame * 0.25, 1, 1400, true);
+        coverage.insert(values.begin(), values.end());
+    }
+    check(coverage.size() == 100 && *coverage.begin() == 0 && *coverage.rbegin() == 99);
+    check(sampler.sample(900, 100.25, 1, 1400, true).empty()); // seek skips 800 seconds
+    check(sampler.sample(900.25, 100.5, 1, 1400, true).empty());
+    check(sampler.sample(900.5, 100.75, 1, 1400, false).empty());
+    check(sampler.sample(900.75, 101, 1, 1400, true).empty());
+    check(sampler.sample(901, 200, 1, 1400, true).empty()); // callback gap
+    sampler.reset();
+    check(sampler.sample(1200, 0, 1, 1400, true).empty()); // restored offset is not watched
+    sampler.reset();
+    check(sampler.sample(0, 0, 1, 1400, true).empty());
+    check(sampler.sample(0, 1, 1, 1400, true).empty()); // stalled clock
+    check(sampler.sample(0.25, 1.25, 1, 1400, true).empty());
+    check(sampler.sample(1, 2, 1, 1400, true) == std::vector<int>({0}));
+    sampler.reset();
+    for (int frame = 0; frame <= 400; ++frame) {
+        auto values = sampler.sample(frame * 0.25, frame * 0.25, 1, 1400, true);
+        coverage.insert(values.begin(), values.end());
+    }
+    check(coverage.size() == 100); // replay does not double count
+    sampler.reset();
+    std::set<int> fast;
+    for (int frame = 0; frame <= 20; ++frame) {
+        auto values = sampler.sample(frame * 0.5, frame * 0.25, 2, 1400, true);
+        fast.insert(values.begin(), values.end());
+    }
+    check(fast.size() == 10);
+    check(sampler.sample(10.5, 5.25, 0, 1400, true).empty());
+    check(sampler.sample(std::numeric_limits<double>::quiet_NaN(), 6, 1, 1400, true).empty());
+    check(sampler.sample(20, 7, 1, 0, true).empty());
+    check(sampler.sample(20, 8, 1, 20000, true).empty());
+    check(sampler.sample(20, 9, 5, 1400, true).empty());
+    check(sampler.sample(-1, 10, 1, 1400, true).empty());
+    check(watchInterest(60, 1400) == 0);
+    check(watchInterest(179, 1400) == 0);
+    check(watchInterest(400, 1400) == 1);
+    check(watchInterest(700, 1400) == 2);
+    check(watchInterest(1120, 1400) == 3);
+    check(watchInterest(1000, 7200) == 0); // a movie needs sufficient coverage too
+    check(watchInterest(1800, 7200) == 1);
+    check(watchInterest(180, 300) == 2); // short episode
+    check(watchInterest(240, 300) == 3);
+    check(watchInterest(100, 50) == 0);
+    check(watchInterest(-1, 1400) == 0);
+    check(watchInterest(1500, 1400) == 0);
+    check(watchInterest(std::numeric_limits<double>::infinity(), 1400) == 0);
+    discovery::Taste negative;
+    discovery::learn(negative, {"fantasy"}, -8);
+    check(discovery::score(favorite, negative) < discovery::score(popular, negative));
+    check(discovery::rank({favorite, popular}, negative) == std::vector<long long>({2,1}));
+    discovery::learn(negative, {"fantasy"}, -1000); check(negative["fantasy"] == -100);
+    check(discovery::score(favorite, negative) >= 0); // disliked is downranked, not a malformed row
+    for (bool hidden : {false, true}) for (bool playing : {false, true})
+        for (bool interacting : {false, true}) for (bool accessible : {false, true})
+            check(discovery::controlsShouldHide(hidden, playing, interacting, accessible, 5, 4) == (!hidden && playing && !interacting && !accessible));
+    check(!discovery::controlsShouldHide(false, true, false, false, 3, 4));
+    check(!discovery::controlsShouldHide(false, true, false, false, std::numeric_limits<double>::quiet_NaN(), 4));
     std::cout << "PASS: " << total << " playback/discovery checks (production C++ headers).\n";
 }

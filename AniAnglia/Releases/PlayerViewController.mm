@@ -14,6 +14,8 @@
 
 #include "PlaybackPolicy.hpp"
 #include "AnimeMapping.hpp"
+#include "../Main/WatchPolicy.hpp"
+#import "../Main/WatchHistory.h"
 
 static void* PlaybackStatusContext = &PlaybackStatusContext;
 static BOOL PlaybackRealNumber(id value) {
@@ -33,17 +35,25 @@ static NSString* PlaybackTime(double seconds) {
     return [NSString stringWithFormat:@"%02ld:%02ld", whole / 60, whole % 60];
 }
 
-// A container keeps interactive buttons ABOVE AVKit (not in its noninteractive contentOverlayView).
-@interface PlayerViewController : UIViewController
+// One public, app-owned control layer: AVKit does not expose native chrome visibility.
+// This avoids private KVO/selectors and keeps every overlay on the same visibility state.
+@interface PlayerViewController : UIViewController <UIGestureRecognizerDelegate>
 @property(nonatomic, strong) AVPlayerViewController* nativePlayer;
 @property(nonatomic, strong) UIButton* skipButton;
 @property(nonatomic, strong) UIButton* nextButton;
 @property(nonatomic, strong) UIButton* openingButton;
-@property(nonatomic, strong) UIButton* controlsButton;
 @property(nonatomic, strong) UIButton* closeButton;
+@property(nonatomic, strong) UIButton* playButton;
 @property(nonatomic, strong) UIStackView* actionStack;
+@property(nonatomic, strong) UIStackView* transportStack;
 @property(nonatomic, strong) UILabel* playbackStatusLabel;
+@property(nonatomic, strong) UILabel* timeLabel;
+@property(nonatomic, strong) UISlider* timeline;
 @property(nonatomic) BOOL overlayHidden;
+@property(nonatomic) BOOL loading;
+@property(nonatomic) BOOL scrubbing;
+@property(nonatomic) BOOL wasPlaying;
+@property(nonatomic) double hideDeadline;
 @property(nonatomic, strong) UIActivityIndicatorView* spinner;
 @property(nonatomic) BOOL pipActive;
 @property(nonatomic) BOOL closing;
@@ -51,40 +61,53 @@ static NSString* PlaybackTime(double seconds) {
 @property(nonatomic, copy) void (^onSkip)(void);
 @property(nonatomic, copy) void (^onNext)(void);
 @property(nonatomic, copy) void (^onOpening)(void);
+@property(nonatomic, copy) void (^onSeek)(void);
 -(void)setLoading:(BOOL)loading;
 -(void)setSkipAvailable:(BOOL)available nextAvailable:(BOOL)hasNext;
+-(void)refreshTransport;
+-(void)revealControls;
+-(void)toggleControls;
+-(void)seekToSeconds:(double)seconds;
 @end
 @implementation PlayerViewController
 -(instancetype)init {
-    if ((self = [super init])) _nativePlayer = [AVPlayerViewController new];
+    if ((self = [super init])) {
+        _nativePlayer = [AVPlayerViewController new];
+        _nativePlayer.showsPlaybackControls = NO;
+        if (@available(iOS 14.2, *)) _nativePlayer.canStartPictureInPictureAutomaticallyFromInline = YES;
+    }
     return self;
 }
 -(UIButton*)buttonWithTitle:(NSString*)title action:(SEL)action {
     UIButton* button = [UIButton buttonWithType:UIButtonTypeSystem];
     [button setTitle:title forState:UIControlStateNormal];
     [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    button.tintColor = UIColor.whiteColor;
     button.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
     button.titleLabel.adjustsFontForContentSizeCategory = YES;
     button.titleLabel.numberOfLines = 2;
-    button.backgroundColor = UIAccessibilityIsReduceTransparencyEnabled() ? [UIColor colorWithWhite:0.08 alpha:1] : UIColor.clearColor;
-    button.layer.cornerRadius = 16; button.clipsToBounds = YES;
+    button.backgroundColor = UIAccessibilityIsReduceTransparencyEnabled() ? [UIColor colorWithWhite:0.10 alpha:1] : [UIColor colorWithWhite:1 alpha:0.06];
+    button.layer.cornerRadius = 22; button.clipsToBounds = YES;
+    button.layer.borderWidth = 0.5; button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.3].CGColor;
     if (!UIAccessibilityIsReduceTransparencyEnabled()) {
-        UIVisualEffectView* material = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialDark]];
-        material.frame = button.bounds; material.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        material.userInteractionEnabled = NO; [button insertSubview:material atIndex:0];
+        UIVisualEffectView* glass = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
+        glass.frame = button.bounds; glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        glass.userInteractionEnabled = NO; [button insertSubview:glass atIndex:0];
     }
     [button.heightAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
-    button.contentEdgeInsets = UIEdgeInsetsMake(10, 14, 10, 14);
+    [button.widthAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
+    button.contentEdgeInsets = UIEdgeInsetsMake(10, 16, 10, 16);
+    button.imageEdgeInsets = UIEdgeInsetsMake(0, -3, 0, 3);
     button.accessibilityLabel = title;
-    [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    if (action) [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return button;
 }
 -(void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = UIColor.blackColor;
+    [super viewDidLoad]; self.view.backgroundColor = UIColor.blackColor;
     [self addChildViewController:self.nativePlayer];
     [self.view addSubview:self.nativePlayer.view];
     [self.nativePlayer didMoveToParentViewController:self];
+    self.nativePlayer.view.userInteractionEnabled = NO;
     self.nativePlayer.view.translatesAutoresizingMaskIntoConstraints = NO;
     [NSLayoutConstraint activateConstraints:@[
         [self.nativePlayer.view.topAnchor constraintEqualToAnchor:self.view.topAnchor],
@@ -92,95 +115,149 @@ static NSString* PlaybackTime(double seconds) {
         [self.nativePlayer.view.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [self.nativePlayer.view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor]
     ]];
-    UIButton* close = [self buttonWithTitle:@"Закрыть" action:@selector(closePressed)];
-    self.closeButton = close;
-    self.controlsButton = [self buttonWithTitle:@"" action:@selector(toggleControls)];
-    [self.controlsButton setImage:[UIImage systemImageNamed:@"eye.slash"] forState:UIControlStateNormal];
-    self.controlsButton.tintColor = UIColor.whiteColor; self.controlsButton.accessibilityLabel = @"Скрыть управление";
+    self.closeButton = [self buttonWithTitle:@"" action:@selector(closePressed)];
+    [self.closeButton setImage:[UIImage systemImageNamed:@"xmark"] forState:UIControlStateNormal];
+    self.closeButton.accessibilityLabel = @"Закрыть плеер";
     self.skipButton = [self buttonWithTitle:@"Пропустить опенинг" action:@selector(skipPressed)];
-    self.nextButton = [self buttonWithTitle:@"Далее →" action:@selector(nextPressed)];
-    self.openingButton = [self buttonWithTitle:@"Опенинг · настроить" action:@selector(openingPressed)];
-    UIStackView* skips = [[UIStackView alloc] initWithArrangedSubviews:@[self.openingButton, self.skipButton, self.nextButton]];
-    self.actionStack = skips;
-    skips.axis = UILayoutConstraintAxisVertical; skips.spacing = 8; skips.alignment = UIStackViewAlignmentTrailing;
-    for (UIView* control in @[close, self.controlsButton, skips]) {
-        [self.view addSubview:control]; control.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.skipButton setImage:[UIImage systemImageNamed:@"forward.end.fill"] forState:UIControlStateNormal];
+    self.nextButton = [self buttonWithTitle:@"Далее" action:@selector(nextPressed)];
+    [self.nextButton setImage:[UIImage systemImageNamed:@"play.rectangle.on.rectangle"] forState:UIControlStateNormal];
+    self.openingButton = [self buttonWithTitle:@"Опенинг" action:@selector(openingPressed)];
+    [self.openingButton setImage:[UIImage systemImageNamed:@"slider.horizontal.3"] forState:UIControlStateNormal];
+    self.actionStack = [[UIStackView alloc] initWithArrangedSubviews:@[self.openingButton, self.skipButton, self.nextButton]];
+    self.actionStack.axis = UILayoutConstraintAxisVertical; self.actionStack.spacing = 8; self.actionStack.alignment = UIStackViewAlignmentTrailing;
+    self.playButton = [self buttonWithTitle:@"" action:@selector(playPressed)];
+    self.playButton.accessibilityLabel = @"Воспроизвести";
+    UIButton* back = [self buttonWithTitle:@"" action:@selector(backPressed)];
+    [back setImage:[UIImage systemImageNamed:@"gobackward.10"] forState:UIControlStateNormal]; back.accessibilityLabel = @"Назад на 10 секунд";
+    UIButton* forward = [self buttonWithTitle:@"" action:@selector(forwardPressed)];
+    [forward setImage:[UIImage systemImageNamed:@"goforward.10"] forState:UIControlStateNormal]; forward.accessibilityLabel = @"Вперёд на 10 секунд";
+    UIButton* speed = [self buttonWithTitle:@"Скорость" action:NULL];
+    NSMutableArray<UIAction*>* speeds = [NSMutableArray new];
+    __weak PlayerViewController* weakSelf = self;
+    for (NSNumber* value in @[@0.5, @1.0, @1.25, @1.5, @2.0]) {
+        [speeds addObject:[UIAction actionWithTitle:[NSString stringWithFormat:@"%@×", value] image:nil identifier:nil handler:^(UIAction* action) {
+            PlayerViewController* owner = weakSelf; if (!owner || owner.loading) return;
+            if (owner.onSeek) owner.onSeek(); owner.nativePlayer.player.rate = value.floatValue;
+            [owner revealControls];
+        }]];
     }
-    UILayoutGuide* safe = self.view.safeAreaLayoutGuide;
-    [NSLayoutConstraint activateConstraints:@[
-        [close.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [close.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
-        [self.controlsButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.controlsButton.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
-        [skips.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
-        [skips.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-100]
-    ]];
-    [skips.widthAnchor constraintLessThanOrEqualToAnchor:safe.widthAnchor constant:-32].active = YES;
+    speed.menu = [UIMenu menuWithTitle:@"Скорость воспроизведения" children:speeds]; speed.showsMenuAsPrimaryAction = YES;
+    AVRoutePickerView* route = [AVRoutePickerView new]; route.tintColor = UIColor.whiteColor; route.activeTintColor = UIColor.systemBlueColor;
+    [route.widthAnchor constraintEqualToConstant:44].active = YES; [route.heightAnchor constraintEqualToConstant:44].active = YES;
+    UIStackView* buttons = [[UIStackView alloc] initWithArrangedSubviews:@[back, self.playButton, forward, speed, route]];
+    buttons.spacing = 6; buttons.alignment = UIStackViewAlignmentCenter; buttons.distribution = UIStackViewDistributionEqualSpacing;
+    self.timeline = [UISlider new]; self.timeline.minimumValue = 0; self.timeline.maximumValue = 1;
+    self.timeline.tintColor = UIColor.whiteColor; self.timeline.accessibilityLabel = @"Позиция в серии";
+    [self.timeline addTarget:self action:@selector(scrubStarted) forControlEvents:UIControlEventTouchDown];
+    [self.timeline addTarget:self action:@selector(scrubFinished) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+    [self.timeline addTarget:self action:@selector(scrubCancelled) forControlEvents:UIControlEventTouchCancel];
+    self.timeLabel = [UILabel new]; self.timeLabel.textColor = UIColor.whiteColor; self.timeLabel.textAlignment = NSTextAlignmentCenter;
+    self.timeLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1]; self.timeLabel.adjustsFontForContentSizeCategory = YES;
+    self.transportStack = [[UIStackView alloc] initWithArrangedSubviews:@[buttons, self.timeline, self.timeLabel]];
+    self.transportStack.axis = UILayoutConstraintAxisVertical; self.transportStack.spacing = 4;
     self.playbackStatusLabel = [UILabel new]; self.playbackStatusLabel.textColor = UIColor.whiteColor;
     self.playbackStatusLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1];
     self.playbackStatusLabel.adjustsFontForContentSizeCategory = YES; self.playbackStatusLabel.numberOfLines = 2;
     self.playbackStatusLabel.textAlignment = NSTextAlignmentCenter;
-    [self.view addSubview:self.playbackStatusLabel]; self.playbackStatusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    for (UIView* control in @[self.closeButton, self.actionStack, self.transportStack, self.playbackStatusLabel]) {
+        [self.view addSubview:control]; control.translatesAutoresizingMaskIntoConstraints = NO;
+    }
+    UILayoutGuide* safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [self.playbackStatusLabel.topAnchor constraintEqualToAnchor:close.bottomAnchor constant:8],
-        [self.playbackStatusLabel.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
-        [self.playbackStatusLabel.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16]
+        [self.closeButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [self.closeButton.topAnchor constraintEqualToAnchor:safe.topAnchor constant:8],
+        [self.playbackStatusLabel.leadingAnchor constraintEqualToAnchor:self.closeButton.trailingAnchor constant:12],
+        [self.playbackStatusLabel.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.playbackStatusLabel.centerYAnchor constraintEqualToAnchor:self.closeButton.centerYAnchor],
+        [self.transportStack.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [self.transportStack.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.transportStack.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-8],
+        [self.actionStack.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.actionStack.bottomAnchor constraintEqualToAnchor:self.transportStack.topAnchor constant:-12],
+        [self.actionStack.widthAnchor constraintLessThanOrEqualToAnchor:safe.widthAnchor constant:-24]
     ]];
     self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
-    self.spinner.color = UIColor.whiteColor;
-    self.spinner.hidesWhenStopped = YES;
+    self.spinner.color = UIColor.whiteColor; self.spinner.hidesWhenStopped = YES;
     [self.view addSubview:self.spinner]; self.spinner.translatesAutoresizingMaskIntoConstraints = NO;
-    [NSLayoutConstraint activateConstraints:@[
-        [self.spinner.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [self.spinner.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor]
-    ]];
-    [self setSkipAvailable:NO nextAvailable:NO];
+    [NSLayoutConstraint activateConstraints:@[[self.spinner.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor], [self.spinner.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor]]];
+    UITapGestureRecognizer* tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggleControls)];
+    tap.delegate = self; tap.cancelsTouchesInView = NO; [self.view addGestureRecognizer:tap];
+    [self setSkipAvailable:NO nextAvailable:NO]; [self revealControls];
+}
+-(BOOL)gestureRecognizer:(UIGestureRecognizer*)recognizer shouldReceiveTouch:(UITouch*)touch {
+    for (UIView* view = touch.view; view && view != self.view; view = view.superview) {
+        if ([view isKindOfClass:UIControl.class] || [view isKindOfClass:AVRoutePickerView.class]) return NO;
+    }
+    return YES;
 }
 -(void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    BOOL compact = self.view.bounds.size.width > self.view.bounds.size.height && !UIContentSizeCategoryIsAccessibilityCategory(self.traitCollection.preferredContentSizeCategory);
-    self.actionStack.axis = compact ? UILayoutConstraintAxisHorizontal : UILayoutConstraintAxisVertical;
+    self.actionStack.axis = self.view.bounds.size.width > self.view.bounds.size.height && !UIContentSizeCategoryIsAccessibilityCategory(self.traitCollection.preferredContentSizeCategory) ? UILayoutConstraintAxisHorizontal : UILayoutConstraintAxisVertical;
 }
--(void)fitVideo {
-    self.nativePlayer.videoGravity = AVLayerVideoGravityResizeAspect;
-    [self.view setNeedsLayout]; [self.view layoutIfNeeded];
+-(void)fitVideo { self.nativePlayer.videoGravity = AVLayerVideoGravityResizeAspect; [self.view setNeedsLayout]; }
+-(void)setOverlayHidden:(BOOL)hidden {
+    _overlayHidden = hidden;
+    for (UIView* view in @[self.closeButton, self.actionStack, self.transportStack, self.playbackStatusLabel]) view.hidden = hidden;
 }
--(void)toggleControls {
-    self.overlayHidden = !self.overlayHidden;
-    self.nativePlayer.showsPlaybackControls = !self.overlayHidden;
-    self.actionStack.hidden = self.overlayHidden;
-    self.closeButton.hidden = self.overlayHidden;
-    self.playbackStatusLabel.hidden = self.overlayHidden;
-    self.controlsButton.alpha = self.overlayHidden ? 0.45 : 1.0;
-    [self.controlsButton setImage:[UIImage systemImageNamed:self.overlayHidden ? @"eye" : @"eye.slash"] forState:UIControlStateNormal];
-    self.controlsButton.accessibilityLabel = self.overlayHidden ? @"Показать управление" : @"Скрыть управление";
+-(void)revealControls { self.overlayHidden = NO; self.hideDeadline = NSProcessInfo.processInfo.systemUptime + 4; }
+-(void)toggleControls { if (self.overlayHidden) [self revealControls]; else self.overlayHidden = YES; }
+-(void)refreshTransport {
+    AVPlayer* player = self.nativePlayer.player;
+    double seconds = CMTimeGetSeconds(player.currentTime), duration = CMTimeGetSeconds(player.currentItem.duration);
+    BOOL valid = std::isfinite(seconds) && std::isfinite(duration) && duration > 0;
+    self.timeline.enabled = valid && !self.loading;
+    if (!self.scrubbing && valid) self.timeline.value = (float)(seconds / duration);
+    self.timeLabel.text = valid ? [NSString stringWithFormat:@"%@ / %@", PlaybackTime(seconds), PlaybackTime(duration)] : @"— / —";
+    BOOL playing = player.rate > 0;
+    [self.playButton setImage:[UIImage systemImageNamed:playing ? @"pause.fill" : @"play.fill"] forState:UIControlStateNormal];
+    self.playButton.accessibilityLabel = playing ? @"Пауза" : @"Воспроизвести";
+    if (!playing && self.wasPlaying) [self revealControls];
+    if (playing && !self.wasPlaying) self.hideDeadline = NSProcessInfo.processInfo.systemUptime + 4;
+    self.wasPlaying = playing;
+    if (UIAccessibilityIsVoiceOverRunning() || UIAccessibilityIsSwitchControlRunning()) [self revealControls];
+    if (discovery::controlsShouldHide(self.overlayHidden, playing, self.scrubbing || self.presentedViewController != nil || self.loading,
+                                     UIAccessibilityIsVoiceOverRunning() || UIAccessibilityIsSwitchControlRunning(), NSProcessInfo.processInfo.systemUptime, self.hideDeadline)) self.overlayHidden = YES;
 }
 -(void)setLoading:(BOOL)loading {
-    [self loadViewIfNeeded];
+    [self loadViewIfNeeded]; _loading = loading;
     if (loading) [self.spinner startAnimating]; else [self.spinner stopAnimating];
-    self.skipButton.enabled = !loading; self.nextButton.enabled = !loading;
-    self.controlsButton.enabled = !loading; self.openingButton.enabled = !loading;
-    self.nativePlayer.showsPlaybackControls = !loading && !self.overlayHidden;
+    self.skipButton.enabled = !loading; self.nextButton.enabled = !loading; self.openingButton.enabled = !loading; self.playButton.enabled = !loading;
+    self.nativePlayer.showsPlaybackControls = NO; self.scrubbing = NO; [self revealControls]; [self refreshTransport];
 }
--(void)setSkipAvailable:(BOOL)available nextAvailable:(BOOL)hasNext {
-    self.skipButton.hidden = !available; self.nextButton.hidden = !hasNext;
+-(void)setSkipAvailable:(BOOL)available nextAvailable:(BOOL)hasNext { self.skipButton.hidden = !available; self.nextButton.hidden = !hasNext; }
+-(void)playPressed { if (self.loading) return; if (self.nativePlayer.player.rate > 0) [self.nativePlayer.player pause]; else [self.nativePlayer.player play]; [self revealControls]; [self refreshTransport]; }
+-(void)seekToSeconds:(double)seconds {
+    double duration = CMTimeGetSeconds(self.nativePlayer.player.currentItem.duration);
+    if (self.loading || !std::isfinite(seconds) || !std::isfinite(duration) || duration <= 0) return;
+    if (self.onSeek) self.onSeek();
+    [self.nativePlayer.player seekToTime:CMTimeMakeWithSeconds(MAX(0, MIN(seconds, duration)), 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+    [self revealControls];
 }
--(void)skipPressed { if (self.onSkip) self.onSkip(); }
--(void)nextPressed { if (self.onNext) self.onNext(); }
--(void)openingPressed { if (self.onOpening) self.onOpening(); }
--(void)closePressed {
-    self.closing = YES;
-    if (self.onClose) self.onClose();
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
--(void)viewDidDisappear:(BOOL)animated {
-    [super viewDidDisappear:animated];
-    if (self.isBeingDismissed && !self.pipActive && !self.closing && self.onClose) self.onClose();
-}
+-(void)backPressed { [self seekToSeconds:CMTimeGetSeconds(self.nativePlayer.player.currentTime) - 10]; }
+-(void)forwardPressed { [self seekToSeconds:CMTimeGetSeconds(self.nativePlayer.player.currentTime) + 10]; }
+-(void)scrubStarted { self.scrubbing = YES; if (self.onSeek) self.onSeek(); [self revealControls]; }
+-(void)scrubFinished { self.scrubbing = NO; [self seekToSeconds:self.timeline.value * CMTimeGetSeconds(self.nativePlayer.player.currentItem.duration)]; }
+-(void)scrubCancelled { self.scrubbing = NO; [self revealControls]; }
+-(void)skipPressed { [self revealControls]; if (self.onSkip) self.onSkip(); }
+-(void)nextPressed { [self revealControls]; if (self.onNext) self.onNext(); }
+-(void)openingPressed { [self revealControls]; if (self.onOpening) self.onOpening(); }
+-(void)closePressed { self.closing = YES; if (self.onClose) self.onClose(); [self dismissViewControllerAnimated:YES completion:nil]; }
+-(void)viewDidDisappear:(BOOL)animated { [super viewDidDisappear:animated]; if (self.isBeingDismissed && !self.pipActive && !self.closing && self.onClose) self.onClose(); }
 -(UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAllButUpsideDown; }
 @end
 
-@interface PlayerController ()
+@interface PlayerController () {
+    discovery::WatchSampler _watchSampler;
+}
+@property(nonatomic, strong) NSMutableDictionary<NSNumber*, NSString*>* releaseGenres;
+@property(nonatomic, strong) NSMutableSet<NSNumber*>* watchSeconds;
+@property(nonatomic, copy) NSString* watchStoreKey;
+@property(nonatomic, copy) NSString* watchReleaseKey;
+@property(nonatomic, copy) NSString* watchEpisodeKey;
+@property(nonatomic) double watchDuration;
+@property(nonatomic) double watchLastFlush;
+@property(nonatomic) BOOL watchDirty;
 @property(nonatomic) anixart::ReleaseID release_id;
 @property(nonatomic) anixart::EpisodeSourceID source_id;
 @property(nonatomic) long source_position;
@@ -226,13 +303,19 @@ static NSString* PlaybackTime(double seconds) {
 -(void)reviewOpeningCandidate;
 -(void)presentOpeningAlert:(UIAlertController*)alert;
 -(void)showOpeningDiagnostics;
+-(void)saveWatchHistory;
+-(void)beginWatchTracking;
+-(void)sampleWatchAt:(double)seconds;
+-(void)applicationBackgrounded;
+-(void)watchHistoryReset:(NSNotification*)notification;
 @end
 
 @implementation PlayerController
 -(instancetype)init {
     if ((self = [super init])) {
         _positions = @[];
-        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(saveProgress) name:UIApplicationDidEnterBackgroundNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(applicationBackgrounded) name:UIApplicationDidEnterBackgroundNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(watchHistoryReset:) name:@"AniWatchHistoryReset" object:nil];
     }
     return self;
 }
@@ -257,6 +340,9 @@ static NSString* PlaybackTime(double seconds) {
 -(void)setEpisodePositions:(NSArray<NSNumber*>*)positions { self.positions = [positions sortedArrayUsingSelector:@selector(compare:)]; }
 -(void)registerReleaseMetadata:(anixart::Release::Ptr)release {
     if (!release) return;
+    if (!self.releaseGenres) self.releaseGenres = [NSMutableDictionary new];
+    self.releaseGenres[@(static_cast<int64_t>(release->id))] = TO_NSSTRING(release->genres) ?: @"";
+    if (self.watchSeconds.count && static_cast<int64_t>(release->id) == self.watchReleaseKey.longLongValue) self.watchDirty = YES;
     NSArray* raw = @[TO_NSSTRING(release->title_original) ?: @"", TO_NSSTRING(release->title_alt) ?: @"", TO_NSSTRING(release->title_ru) ?: @""];
     NSMutableOrderedSet<NSString*>* titles = [NSMutableOrderedSet new];
     NSString* query = nil;
@@ -425,6 +511,51 @@ static NSString* PlaybackTime(double seconds) {
     long next = playback::nextPosition(positions, self.source_position);
     return next < 0 ? nil : @(next);
 }
+-(void)watchHistoryReset:(NSNotification*)notification {
+    if ([notification.object isEqual:self.watchStoreKey]) {
+        [self.watchSeconds removeAllObjects]; self.watchDirty = NO; _watchSampler.reset();
+    }
+}
+-(void)applicationBackgrounded {
+    [self saveProgress]; [self saveWatchHistory]; _watchSampler.reset();
+}
+-(void)beginWatchTracking {
+    _watchSampler.reset(); self.watchSeconds = [NSMutableSet new]; self.watchDirty = NO;
+    self.watchStoreKey = nil; self.watchEpisodeKey = nil; self.watchReleaseKey = nil; self.watchDuration = 0;
+    if (!self.progressKey) return;
+    NSArray<NSString*>* parts = [self.progressKey componentsSeparatedByString:@":"];
+    if (parts.count != 4) return;
+    self.watchStoreKey = AniWatchKey(parts[0].longLongValue); self.watchReleaseKey = parts[1];
+    long episode = [self automaticEpisodeForTotal:[[self currentReleaseMetadata][@"episodes"] longValue]];
+    self.watchEpisodeKey = episode > 0 ? [NSString stringWithFormat:@"episode:%ld", episode] : [NSString stringWithFormat:@"source:%@:%@", parts[2], parts[3]];
+    self.watchDuration = CMTimeGetSeconds(self.observedItem.duration);
+    NSDictionary* title = [[NSUserDefaults.standardUserDefaults dictionaryForKey:self.watchStoreKey] objectForKey:self.watchReleaseKey];
+    NSDictionary* record = title[@"episodes"][self.watchEpisodeKey];
+    // Do not transfer coverage to another montage with a different duration.
+    if (std::isfinite(self.watchDuration) && std::abs([record[@"duration"] doubleValue] - self.watchDuration) <= 1) {
+        self.watchSeconds = AniWatchSeconds(record, self.watchDuration);
+    }
+    self.watchLastFlush = NSProcessInfo.processInfo.systemUptime;
+}
+-(void)sampleWatchAt:(double)seconds {
+    if (!self.watchStoreKey) return;
+    BOOL sameProfile = [self.watchStoreKey isEqualToString:AniWatchKey((long long)static_cast<int64_t>([[AppDataController sharedInstance] getMyProfileID]))];
+    BOOL visible = UIApplication.sharedApplication.applicationState == UIApplicationStateActive || self.player_view_controller.pipActive;
+    BOOL active = sameProfile && visible && self.ready && !self.resumePending && !self.player_view_controller.scrubbing && self.observedPlayer.timeControlStatus == AVPlayerTimeControlStatusPlaying;
+    double now = NSProcessInfo.processInfo.systemUptime;
+    for (int second : _watchSampler.sample(seconds, now, self.observedPlayer.rate, self.watchDuration, active)) {
+        NSNumber* value = @(second);
+        if (![self.watchSeconds containsObject:value]) { [self.watchSeconds addObject:value]; self.watchDirty = YES; }
+    }
+    if (now - self.watchLastFlush >= 15) { [self saveWatchHistory]; self.watchLastFlush = now; }
+}
+-(void)saveWatchHistory {
+    if (!self.watchDirty || !self.watchStoreKey || !self.watchReleaseKey || !self.watchEpisodeKey || !std::isfinite(self.watchDuration) || self.watchDuration <= 0) return;
+    NSString* genres = self.releaseGenres[@(self.watchReleaseKey.longLongValue)] ?: @"";
+    AniStoreWatch(self.watchStoreKey, self.watchReleaseKey, self.watchEpisodeKey, genres, self.watchSeconds, self.watchDuration);
+    self.watchDirty = NO;
+}
+
 -(void)saveProgress {
     if (!self.ready || self.resumePending || !self.progressKey || !self.observedPlayer) return;
     double seconds = CMTimeGetSeconds(self.observedPlayer.currentTime);
@@ -436,6 +567,7 @@ static NSString* PlaybackTime(double seconds) {
     [[NSUserDefaults standardUserDefaults] setObject:progress forKey:@"playback_progress"];
 }
 -(void)stopObserving {
+    [self saveWatchHistory]; _watchSampler.reset(); self.watchStoreKey = nil;
     [self saveProgress];
     ++self.openingRequestVersion; [self.openingRequest cancel]; self.openingRequest = nil;
     if (self.timeObserver) [self.observedPlayer removeTimeObserver:self.timeObserver];
@@ -464,7 +596,7 @@ static NSString* PlaybackTime(double seconds) {
     self.player_view_controller.nativePlayer.delegate = self;
     self.player_view_controller.modalPresentationStyle = UIModalPresentationFullScreen;
     self.player_view_controller.nativePlayer.videoGravity = AVLayerVideoGravityResizeAspect;
-    self.player_view_controller.nativePlayer.showsPlaybackControls = YES;
+    self.player_view_controller.nativePlayer.showsPlaybackControls = NO;
     self.player_view_controller.view.backgroundColor = UIColor.blackColor;
     __weak PlayerController* weakSelf = self;
     __weak PlayerViewController* weakController = self.player_view_controller;
@@ -476,6 +608,7 @@ static NSString* PlaybackTime(double seconds) {
         owner.player_view_controller.nativePlayer.player = nil;
         owner.player_view_controller = nil;
     };
+    self.player_view_controller.onSeek = ^{ PlayerController* owner = weakSelf; if (owner) owner->_watchSampler.reset(); };
     self.player_view_controller.onSkip = ^{ [weakSelf skipOpening]; };
     self.player_view_controller.onNext = ^{ [weakSelf playNextEpisode]; };
     self.player_view_controller.onOpening = ^{ [weakSelf showOpeningMenu]; };
@@ -560,12 +693,14 @@ static NSString* PlaybackTime(double seconds) {
         double duration = CMTimeGetSeconds(self.observedItem.duration);
         if (!std::isfinite(resume) || resume < 0 || (std::isfinite(duration) && resume >= duration - 3)) resume = 0;
         __weak PlayerController* weakSelf = self;
+        _watchSampler.reset();
         [self.observedPlayer seekToTime:CMTimeMakeWithSeconds(resume, 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero completionHandler:^(BOOL finished) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 PlayerController* owner = weakSelf;
                 if (!owner || generation != owner.generation) return;
                 if (owner.observedItem.status != AVPlayerItemStatusReadyToPlay) { [owner showPlaybackError]; return; }
                 owner.resumePending = NO;
+                [owner beginWatchTracking];
                 [owner.player_view_controller setLoading:NO];
                 [owner updatePlaybackAt:CMTimeGetSeconds(owner.observedPlayer.currentTime)];
                 if (generation != owner.generation) return;
@@ -578,6 +713,8 @@ static NSString* PlaybackTime(double seconds) {
                     PlayerController* current = weakSelf;
                     if (!current || generation != current.generation) return;
                     double seconds = CMTimeGetSeconds(time);
+                    [current sampleWatchAt:seconds];
+                    [current.player_view_controller refreshTransport];
                     [current updatePlaybackAt:seconds];
                     if (generation != current.generation) return;
                     if (current.lastSaveTime < 0 || std::abs(seconds - current.lastSaveTime) >= 5) {
@@ -874,11 +1011,13 @@ static NSString* PlaybackTime(double seconds) {
     [alert addAction:[UIAlertAction actionWithTitle:@"Посмотреть начало" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
         if (generation != self.generation) return;
         self.previewingOpening = YES;
+        _watchSampler.reset();
         [self.observedPlayer seekToTime:CMTimeMakeWithSeconds(MAX(0, begin - 2), 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Посмотреть конец" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
         if (generation != self.generation) return;
         self.previewingOpening = YES;
+        _watchSampler.reset();
         [self.observedPlayer seekToTime:CMTimeMakeWithSeconds(MAX(begin, end - 2), 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Границы верны — сохранить" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
@@ -921,6 +1060,7 @@ static NSString* PlaybackTime(double seconds) {
     self.openingHandled = YES;
     [self.player_view_controller setSkipAvailable:NO nextAvailable:[self nextPosition] != nil];
     NSUInteger generation = self.generation;
+    _watchSampler.reset();
     [self.observedPlayer seekToTime:CMTimeMakeWithSeconds(target, 600) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero completionHandler:^(BOOL finished) {
         dispatch_async(dispatch_get_main_queue(), ^{ if (finished && generation == self.generation) [self saveProgress]; });
     }];
@@ -928,7 +1068,7 @@ static NSString* PlaybackTime(double seconds) {
 -(void)updatePlaybackAt:(double)seconds {
     if (!self.ready || self.resumePending || !std::isfinite(seconds)) return;
     BOOL hasNext = [self nextPosition] != nil;
-    NSString* openingTitle = self.pendingOpeningStart >= 0 ? @"Опенинг · отметить конец" : (self.openingCandidate ? @"Опенинг · проверить" : ([self openingRecord] ? @"Опенинг · изменить" : @"Опенинг · настроить"));
+    NSString* openingTitle = self.pendingOpeningStart >= 0 ? @"Конец опенинга" : (self.openingCandidate ? @"Проверить опенинг" : @"Опенинг");
     [self.player_view_controller.openingButton setTitle:openingTitle forState:UIControlStateNormal];
     double target = [self openingTargetAt:seconds];
     [self.player_view_controller setSkipAvailable:target >= 0 nextAvailable:hasNext];

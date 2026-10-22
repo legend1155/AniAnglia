@@ -19,6 +19,8 @@
 #import "AppDataController.h"
 #import "ModernStyle.h"
 #include "DiscoveryPolicy.hpp"
+#include "WatchPolicy.hpp"
+#import "WatchHistory.h"
 #include <set>
 #include <exception>
 
@@ -40,12 +42,15 @@ static std::vector<std::string> HomeGenres(const std::string& value) {
 @property(nonatomic, strong) NSMutableArray<NSString*>* selected;
 @property(nonatomic, copy) NSString* storageKey;
 @property(nonatomic, copy) NSString* hiddenKey;
+@property(nonatomic, copy) NSString* watchKey;
+@property(nonatomic, copy) NSString* negativeKey;
 @property(nonatomic, copy) void (^onChange)(void);
 @end
 @implementation HomeTasteController
 -(void)viewDidLoad {
     [super viewDidLoad]; self.title = @"Мои жанры";
     self.storageKey = HomeProfileKey(@"genres"); self.hiddenKey = HomeProfileKey(@"hidden");
+    self.watchKey = AniWatchKey((long long)static_cast<int64_t>([[AppDataController sharedInstance] getMyProfileID])); self.negativeKey = HomeProfileKey(@"negative_genres");
     self.genres = [[LibanixartApi sharedInstance] getGenresArray] ?: @[];
     self.selected = [[[NSUserDefaults standardUserDefaults] stringArrayForKey:self.storageKey] mutableCopy] ?: [NSMutableArray new];
     self.tableView.backgroundColor = UIColor.systemGroupedBackgroundColor;
@@ -57,7 +62,15 @@ static std::vector<std::string> HomeGenres(const std::string& value) {
         [self.selected removeAllObjects]; [self saveGenres]; [self.tableView reloadData];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Вернуть скрытые аниме" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
-        [[NSUserDefaults standardUserDefaults] removeObjectForKey:self.hiddenKey]; if (self.onChange) self.onChange();
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:self.hiddenKey];
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:self.negativeKey]; if (self.onChange) self.onChange();
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Сбросить обучение по просмотру" style:UIAlertActionStyleDestructive handler:^(UIAlertAction* action) {
+        NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
+        [defaults removeObjectForKey:self.watchKey];
+        [NSNotificationCenter.defaultCenter postNotificationName:@"AniWatchHistoryReset" object:self.watchKey];
+        [defaults setInteger:[defaults integerForKey:AniWatchRevisionKey(self.watchKey)] + 1 forKey:AniWatchRevisionKey(self.watchKey)];
+        if (self.onChange) self.onChange();
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
@@ -67,7 +80,7 @@ static std::vector<std::string> HomeGenres(const std::string& value) {
     if (self.onChange) self.onChange();
 }
 -(NSInteger)tableView:(UITableView*)tableView numberOfRowsInSection:(NSInteger)section { return self.genres.count; }
--(NSString*)tableView:(UITableView*)tableView titleForFooterInSection:(NSInteger)section { return self.genres.count ? @"Необязательные предпочтения. Избранное и высокие оценки тоже учитываются. Подбор выполняется локально, без отдельного сервера." : @"Список жанров пока недоступен. Вернись после загрузки каталога."; }
+-(NSString*)tableView:(UITableView*)tableView titleForFooterInSection:(NSInteger)section { return self.genres.count ? @"Необязательные предпочтения. Учитываются реально просмотренные минуты и доля серии, избранное и оценки. Короткий выход нейтрален; «Неинтересно» — явный отрицательный сигнал. Подбор выполняется локально, без отдельного сервера." : @"Список жанров пока недоступен. Вернись после загрузки каталога."; }
 -(UITableViewCell*)tableView:(UITableView*)tableView cellForRowAtIndexPath:(NSIndexPath*)path {
     UITableViewCell* cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
     cell.textLabel.text = self.genres[path.row]; cell.textLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
@@ -93,6 +106,7 @@ static std::vector<std::string> HomeGenres(const std::string& value) {
 @property(nonatomic, copy) NSString* summary;
 @property(nonatomic, strong) UILabel* statusLabel;
 @property(nonatomic, strong) NSDate* lastRefresh;
+@property(nonatomic) NSInteger watchRevision;
 -(void)refreshRecommendations;
 -(void)editTaste;
 @end
@@ -114,7 +128,9 @@ static std::vector<std::string> HomeGenres(const std::string& value) {
     [super viewWillAppear:animated];
     BOOL changedProfile = self.loadedProfile && ![self.loadedProfile isEqualToString:HomeProfileKey(@"profile")];
     if (changedProfile) { ++self.generation; self.loading = NO; _items.clear(); _taste.clear(); [self.tableView reloadData]; }
-    if (changedProfile || self.dirty || (!self.loading && self.lastRefresh && -self.lastRefresh.timeIntervalSinceNow > 300)) [self refreshRecommendations];
+    NSString* watchKey = AniWatchKey((long long)static_cast<int64_t>([[AppDataController sharedInstance] getMyProfileID]));
+    BOOL changedWatch = self.watchRevision != [NSUserDefaults.standardUserDefaults integerForKey:AniWatchRevisionKey(watchKey)];
+    if (changedProfile || changedWatch || self.dirty || (!self.loading && self.lastRefresh && -self.lastRefresh.timeIntervalSinceNow > 300)) [self refreshRecommendations];
 }
 -(void)editTaste {
     HomeTasteController* choices = [[HomeTasteController alloc] initWithStyle:UITableViewStyleInsetGrouped];
@@ -128,6 +144,12 @@ static std::vector<std::string> HomeGenres(const std::string& value) {
     NSUInteger generation = ++self.generation;
     NSString* profileKey = HomeProfileKey(@"profile"); self.loadedProfile = profileKey;
     auto profileID = [[AppDataController sharedInstance] getMyProfileID];
+    NSString* watchKey = AniWatchKey((long long)static_cast<int64_t>(profileID));
+    NSDictionary* watchHistory = [NSUserDefaults.standardUserDefaults dictionaryForKey:watchKey] ?: @{};
+    NSDictionary* negativeGenres = [NSUserDefaults.standardUserDefaults dictionaryForKey:HomeProfileKey(@"negative_genres")] ?: @{};
+    self.watchRevision = [NSUserDefaults.standardUserDefaults integerForKey:AniWatchRevisionKey(watchKey)];
+    __block double watchedMinutes = 0;
+
     NSArray<NSString*>* preferred = [[NSUserDefaults standardUserDefaults] stringArrayForKey:HomeProfileKey(@"genres")] ?: @[];
     NSArray<NSString*>* catalogueGenres = [[LibanixartApi sharedInstance] getGenresArray] ?: @[];
     NSArray<NSString*>* hidden = [[NSUserDefaults standardUserDefaults] stringArrayForKey:HomeProfileKey(@"hidden")] ?: @[];
@@ -144,7 +166,26 @@ static std::vector<std::string> HomeGenres(const std::string& value) {
             if (normalized.size() == 1) officialGenres[normalized.front()] = TO_STDSTRING(genre);
         }
         for (NSString* idText in hidden) excluded.insert(idText.longLongValue);
-        for (NSString* genre in preferred) discovery::learn(taste, HomeGenres(TO_STDSTRING(genre)), 6);
+        for (NSString* genre in preferred) discovery::learn(taste, HomeGenres(TO_STDSTRING(genre)), 12);
+        for (NSString* releaseID in watchHistory) {
+            NSDictionary* title = watchHistory[releaseID];
+            if (![title isKindOfClass:NSDictionary.class]) continue;
+            NSDictionary* episodes = title[@"episodes"]; int interest = 0; double titleWatched = 0;
+            if (![episodes isKindOfClass:NSDictionary.class]) continue;
+            for (NSString* episode in episodes) {
+                NSDictionary* record = episodes[episode];
+                if (![record isKindOfClass:NSDictionary.class]) continue;
+                double duration = [record[@"duration"] doubleValue];
+                if (!std::isfinite(duration) || duration <= 0 || duration > 18000) continue;
+                NSSet* unique = AniWatchSeconds(record, duration);
+                double watched = unique.count;
+                interest = std::min(8, interest + discovery::watchInterest(watched, duration));
+                titleWatched += watched;
+            }
+            watchedMinutes += titleWatched / 60;
+            if (titleWatched >= 60) excluded.insert(releaseID.longLongValue);
+            if ([title[@"genres"] isKindOfClass:NSString.class]) discovery::learn(taste, HomeGenres(TO_STDSTRING(title[@"genres"])), interest);
+        }
         // Bounded requests. Candidate membership flags additionally exclude watched/dropped titles.
         try {
             auto pages = api->releases().profile_favorites(profileID, anixart::Profile::ListSort::Descending, 0, 0);
@@ -159,14 +200,19 @@ static std::vector<std::string> HomeGenres(const std::string& value) {
                 if (!seed) continue;
                 excluded.insert(static_cast<int64_t>(seed->id));
                 int vote = seed->my_vote > 0 ? seed->my_vote : seed->your_vote;
-                if (vote >= 4 && vote <= 5) discovery::learn(taste, HomeGenres(seed->genres), 3);
+                if (vote >= 4 && vote <= 5) discovery::learn(taste, HomeGenres(seed->genres), 6);
+                else if (vote >= 1 && vote <= 2) discovery::learn(taste, HomeGenres(seed->genres), -8);
             }
         } catch (const std::exception&) { partial = YES; }
         try {
             auto pages = api->releases().get_history(0);
             for (const auto& seed : pages->get()) if (seed) excluded.insert(static_cast<int64_t>(seed->id));
         } catch (const std::exception&) { partial = YES; }
-        personalized = !taste.empty();
+        for (NSString* releaseID in negativeGenres) {
+            id genres = negativeGenres[releaseID];
+            if ([genres isKindOfClass:NSString.class]) discovery::learn(taste, HomeGenres(TO_STDSTRING(genres)), -8);
+        }
+        personalized = std::any_of(taste.begin(), taste.end(), [](const auto& value) { return value.second != 0; });
         std::vector<anixart::Release::Ptr> pool;
         anixart::requests::FilterRequest request;
         request.sort = anixart::requests::FilterRequest::Popular;
@@ -179,6 +225,7 @@ static std::vector<std::string> HomeGenres(const std::string& value) {
         std::vector<std::pair<std::string, int>> top(taste.begin(), taste.end());
         std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second != b.second ? a.second > b.second : a.first < b.first; });
         for (std::size_t i = 0; i < std::min<std::size_t>(2, top.size()); ++i) {
+            if (top[i].second <= 0) continue;
             auto official = officialGenres.find(top[i].first);
             if (official == officialGenres.end()) continue;
             request.genres = {official->second};
@@ -206,10 +253,12 @@ static std::vector<std::string> HomeGenres(const std::string& value) {
         if (!owner || generation != owner.generation || ![profileKey isEqualToString:HomeProfileKey(@"profile")]) return;
         owner.loading = NO; owner.lastRefresh = NSDate.date; [owner.refreshControl endRefreshing];
         if (!errored) { owner->_items = std::move(result); owner->_taste = std::move(taste); }
-        owner.summary = errored ? @"Не удалось обновить подборку. Потяни вниз, чтобы повторить." : (personalized ? @"По выбранным жанрам, избранному и доступным высоким оценкам." : @"Популярное для начала. Добавь избранное, оценки или выбери свои жанры.");
+        owner.summary = errored ? @"Не удалось обновить подборку. Потяни вниз, чтобы повторить." : (personalized ? @"По фактическому просмотру, жанрам, избранному, оценкам и «Неинтересно»." : @"Популярное для начала. Добавь избранное, оценки или выбери свои жанры.");
+        if (watchedMinutes > 0 && !errored) owner.summary = [owner.summary stringByAppendingFormat:@" Учтено %.0f мин просмотра на этом устройстве; это сигнал интереса, а не точная оценка вкуса.", watchedMinutes];
         if (partial && !errored) owner.summary = [owner.summary stringByAppendingString:@" Часть данных недоступна; подборка может быть неполной."];
         owner.statusLabel.text = owner->_items.empty() ? (errored ? owner.summary : @"Подходящих новых аниме пока нет. Измени жанры или обнови подборку.") : @"";
         [owner.tableView reloadData];
+        if (owner.watchRevision != [NSUserDefaults.standardUserDefaults integerForKey:AniWatchRevisionKey(watchKey)]) owner.dirty = YES;
         if (owner.dirty) [owner refreshRecommendations];
     }];
 }
@@ -225,7 +274,7 @@ static std::vector<std::string> HomeGenres(const std::string& value) {
     [cell setImageUrl:[NSURL URLWithString:TO_NSSTRING(release->image_url)]];
     [cell setRating:release->grade]; [cell setEpCount:std::max(0, release->episodes_released) totalEpCount:std::max(0, release->episodes_total)];
     NSMutableArray<NSString*>* reasons = [NSMutableArray new];
-    for (const auto& genre : HomeGenres(release->genres)) if (_taste.contains(genre)) [reasons addObject:TO_NSSTRING(genre)];
+    for (const auto& genre : HomeGenres(release->genres)) if (_taste.contains(genre) && _taste.at(genre) > 0) [reasons addObject:TO_NSSTRING(genre)];
     NSString* reason = reasons.count ? [NSString stringWithFormat:@"Твои жанры: %@", [reasons componentsJoinedByString:@", "]] : @"Популярное в каталоге";
     [cell setDescription:[NSString stringWithFormat:@"%@ · %@", TO_NSSTRING(release->year) ?: @"", reason]];
     cell.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor; cell.layer.cornerRadius = 18; cell.clipsToBounds = YES;
@@ -238,6 +287,7 @@ static std::vector<std::string> HomeGenres(const std::string& value) {
 }
 -(UISwipeActionsConfiguration*)tableView:(UITableView*)tableView trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath*)path {
     auto releaseID = static_cast<int64_t>(_items[(std::size_t)path.row]->id);
+    NSString* rejectedGenres = TO_NSSTRING(_items[(std::size_t)path.row]->genres) ?: @"";
     __weak HomeRecommendationsController* weakSelf = self;
     UIContextualAction* hide = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"Неинтересно" handler:^(UIContextualAction* action, UIView* view, void (^completion)(BOOL)) {
         HomeRecommendationsController* owner = weakSelf;
@@ -248,6 +298,11 @@ static std::vector<std::string> HomeGenres(const std::string& value) {
         if (![hidden containsObject:value]) [hidden addObject:value];
         if (hidden.count > 500) [hidden removeObjectAtIndex:0];
         [[NSUserDefaults standardUserDefaults] setObject:hidden forKey:key];
+        NSString* negativeKey = HomeProfileKey(@"negative_genres");
+        NSMutableDictionary* negatives = [[NSUserDefaults.standardUserDefaults dictionaryForKey:negativeKey] mutableCopy] ?: [NSMutableDictionary new];
+        negatives[value] = rejectedGenres;
+        for (NSString* titleID in [negatives.allKeys copy]) if (![hidden containsObject:titleID]) [negatives removeObjectForKey:titleID];
+        [NSUserDefaults.standardUserDefaults setObject:negatives forKey:negativeKey];
         owner.dirty = YES;
         std::erase_if(owner->_items, [releaseID](const auto& release) { return static_cast<int64_t>(release->id) == releaseID; });
         if (owner->_items.empty()) owner.statusLabel.text = @"Все предложения скрыты. Можно изменить жанры или вернуть скрытые аниме в настройках подбора.";
